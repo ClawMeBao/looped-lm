@@ -1,5 +1,5 @@
 """
-Connect Layer — Phase 0 prototype
+Connect Layer — dùng chung cho tất cả phases.
 Implements: MLPConnectLayer (Phương án B) + GatedResidualConnectLayer (Phương án C)
 
 Mục tiêu: remap hidden state từ loop block output (layer j space)
@@ -10,6 +10,14 @@ Input/Output shape: [batch, seq_len, d_model]  (d_model = 2048 với Qwen3-1.7B)
 
 import torch
 import torch.nn as nn
+
+
+def _build_norm(d_model: int) -> nn.Module:
+    """RMSNorm (PyTorch ≥2.4) với fallback sang LayerNorm."""
+    if hasattr(nn, "RMSNorm"):
+        return nn.RMSNorm(d_model, eps=1e-6)
+    # Fallback cho PyTorch < 2.4
+    return nn.LayerNorm(d_model, eps=1e-6, elementwise_affine=True)
 
 
 # ---------------------------------------------------------------------------
@@ -32,7 +40,7 @@ class MLPConnectLayer(nn.Module):
         self.down_proj = nn.Linear(d_model, d_inner, bias=False)
         self.up_proj   = nn.Linear(d_inner, d_model, bias=False)
         self.act       = nn.SiLU()
-        self.norm      = nn.RMSNorm(d_model, eps=1e-6)
+        self.norm      = _build_norm(d_model)
 
         # Khởi tạo gần identity để tránh training collapse ban đầu
         nn.init.normal_(self.down_proj.weight, std=0.02)
@@ -81,7 +89,7 @@ class GatedResidualConnectLayer(nn.Module):
         # Gate network (scalar per token)
         self.gate_proj = nn.Linear(d_model, 1, bias=True)
 
-        self.norm = nn.RMSNorm(d_model, eps=1e-6)
+        self.norm = _build_norm(d_model)
 
         # Init: transform gần zero ban đầu, gate gần 0.5 (neutral)
         nn.init.normal_(self.transform[0].weight, std=0.02)

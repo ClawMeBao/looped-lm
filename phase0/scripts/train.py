@@ -103,9 +103,10 @@ def main():
                                   lr=args.lr, betas=(0.9, 0.95), weight_decay=0.01)
     scheduler = get_cosine_schedule_with_warmup(optimizer, args.warmup_steps, args.max_steps)
 
-    # Baseline PPL
+    # True baseline: n_iter=0 sau Bug5 fix = all 28 layers = HF model gốc
     baseline_ppl = eval_ppl(model, eval_dl, device, n_iter=0)
-    print(f"\nBaseline PPL (n_iter=0): {baseline_ppl:.2f}\n")
+    print(f"\nBaseline PPL (n_iter=0, all 28 layers): {baseline_ppl:.2f}")
+    print(f"  (Expected ~8-15 for Qwen3-1.7B on WikiText-2)\n")
 
     best_ppl, step, log_loss = float("inf"), 0, 0.0
     data_iter = iter(train_dl)
