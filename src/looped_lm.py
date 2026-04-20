@@ -18,6 +18,7 @@ NOTE về Qwen3-1.7B vs Qwen3.5-2B:
 
 from __future__ import annotations
 
+import inspect
 import math
 from dataclasses import dataclass, field
 from typing import Optional
@@ -114,6 +115,9 @@ class LoopedLM(nn.Module):
         self._embed_tokens      = self.backbone.embed_tokens
         self._rotary_emb        = self.backbone.rotary_emb
         self._norm              = self.backbone.norm
+        self._rotary_uses_position_ids = (
+            "position_ids" in inspect.signature(self._rotary_emb.forward).parameters
+        )
 
     # -----------------------------------------------------------------------
     # Core forward helpers
@@ -150,8 +154,10 @@ class LoopedLM(nn.Module):
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
             )
-            # DecoderLayer trả về tuple; element đầu luôn là hidden_states
-            hidden_states = layer_out[0]
+            if isinstance(layer_out, tuple):
+                hidden_states = layer_out[0]
+            else:
+                hidden_states = layer_out
         return hidden_states
 
     def _run_loop_block(
@@ -197,8 +203,11 @@ class LoopedLM(nn.Module):
         # 2. Position IDs
         position_ids = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)  # [B, S]
 
-        # 3. Rotary embeddings — truyền position_ids
-        position_embeddings = self._rotary_emb(hidden_states, position_ids)  # (cos, sin)
+        # 3. Rotary embeddings — tương thích cả API cũ (seq_len) và mới (position_ids)
+        if self._rotary_uses_position_ids:
+            position_embeddings = self._rotary_emb(hidden_states, position_ids)  # (cos, sin)
+        else:
+            position_embeddings = self._rotary_emb(hidden_states, seq_len=S)  # (cos, sin)
 
         # 4. Causal attention mask [B, 1, S, S] với -inf ở upper triangle
         # HF transformers 4.44+ dùng float mask (không phải bool)
@@ -230,11 +239,11 @@ class LoopedLM(nn.Module):
             if should_detach or self.cfg.full_detach:
                 h_loop_in = h_loop_in.detach()
 
-            # Loop block (frozen)
-            with torch.no_grad():
-                h_loop_out = self._run_loop_block(
-                    h_loop_in, position_embeddings, causal_mask, position_ids,
-                )
+            # Loop block dùng frozen weights nhưng vẫn cần autograd qua activations
+            # để gradient quay về connect layer ở các iterations trước.
+            h_loop_out = self._run_loop_block(
+                h_loop_in, position_embeddings, causal_mask, position_ids,
+            )
 
             # Connect layer (trainable) — remap h_loop_out → h_loop_in space
             if isinstance(self.connect, GatedResidualConnectLayer):
@@ -244,15 +253,14 @@ class LoopedLM(nn.Module):
 
             h_prev = h_loop_in
 
-        # 6. Suffix (frozen)
-        with torch.no_grad():
-            h = self._run_layers(
-                h_loop_in, self._suffix_layers,
-                position_embeddings, causal_mask, position_ids,
-            )
+        # 6. Suffix (frozen) — không dùng no_grad để giữ đường gradient về connect
+        h = self._run_layers(
+            h_loop_in, self._suffix_layers,
+            position_embeddings, causal_mask, position_ids,
+        )
 
-            # Final norm
-            h = self._norm(h)
+        # Final norm
+        h = self._norm(h)
 
         # 7. LM Head (frozen)
         logits = self.lm_head(h)   # [B, S, vocab]
@@ -286,7 +294,12 @@ class LoopedLM(nn.Module):
         dtype: torch.dtype,
     ) -> torch.Tensor:
         """Tạo causal mask [B, 1, S, S] với -inf ở upper triangle."""
-        mask = torch.full((seq_len, seq_len), torch.finfo(dtype).min, device=device)
+        mask = torch.full(
+            (seq_len, seq_len),
+            torch.finfo(dtype).min,
+            device=device,
+            dtype=dtype,
+        )
         mask = torch.triu(mask, diagonal=1)
         return mask[None, None, :, :].expand(batch_size, 1, -1, -1)
 
