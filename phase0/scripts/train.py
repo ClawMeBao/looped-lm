@@ -42,11 +42,14 @@ def parse_args():
 
 
 def curriculum_n_iter(step: int, max_steps: int, max_n: int) -> int:
-    """25% warmup ở n=1, sau đó tăng tuyến tính lên max_n."""
+    """Divide training into max_n equal stages: 25% each at n=1,2,...,max_n."""
     if step / max_steps < 0.25:
         return 1
     prog = (step / max_steps - 0.25) / 0.75
-    return min(max_n, 1 + int(prog * (max_n - 1)))
+    # Bug fix: was `1 + int(prog * (max_n-1))` which never reached max_n
+    # (requires prog=1.0 exactly, but last step has prog<1.0).
+    # Fix: start post-warmup at n=2, use same step size.
+    return min(max_n, 2 + int(prog * (max_n - 1)))
 
 
 def eval_ppl(model, loader, device, n_iter) -> float:
@@ -93,8 +96,10 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
 
     train_ds = load_text_dataset(tokenizer, max_length=args.seq_len,
+                                 split="train",
                                  max_samples=args.max_samples)
     eval_ds  = load_text_dataset(tokenizer, max_length=args.seq_len,
+                                 split="validation",
                                  max_samples=50)
     train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,  drop_last=True)
     eval_dl  = DataLoader(eval_ds,  batch_size=args.batch_size, shuffle=False)
