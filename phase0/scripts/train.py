@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
 
 from phase0.src import Phase0Model, Phase0Config
-from common.data_utils import load_text_dataset
+from common.data_utils import load_text_dataset, load_instruction_dataset
 
 
 def parse_args():
@@ -26,8 +26,8 @@ def parse_args():
     p.add_argument("--n_iter",         type=int,   default=3)
     p.add_argument("--max_steps",      type=int,   default=1000)
     p.add_argument("--eval_steps",     type=int,   default=200)
-    p.add_argument("--batch_size",     type=int,   default=2)
-    p.add_argument("--seq_len",        type=int,   default=256)
+    p.add_argument("--batch_size",     type=int,   default=8)
+    p.add_argument("--seq_len",        type=int,   default=512)
     p.add_argument("--lr",             type=float, default=3e-4)
     p.add_argument("--warmup_steps",   type=int,   default=50)
     p.add_argument("--grad_clip",      type=float, default=1.0)
@@ -38,6 +38,11 @@ def parse_args():
     p.add_argument("--output_dir",     default="phase0/checkpoints")
     p.add_argument("--dtype",          default="bfloat16",
                    choices=["float32", "bfloat16", "float16"])
+    p.add_argument("--dataset",        default="Roman1111111/claude-opus-4.6-10000x",
+                   help="HuggingFace dataset name (instruction) or 'wikitext' (text)")
+    p.add_argument("--dataset_type",   default="instruction",
+                   choices=["instruction", "text"],
+                   help="'instruction' dùng chat template + label mask; 'text' dùng plain blocks")
     return p.parse_args()
 
 
@@ -52,6 +57,17 @@ def curriculum_n_iter(step: int, max_steps: int, max_n: int) -> int:
     return min(max_n, 2 + int(prog * (max_n - 1)))
 
 
+def _unpack_batch(batch, device):
+    """Return (input_ids, labels) from either a tensor or dict batch."""
+    if isinstance(batch, dict):
+        ids    = batch["input_ids"].to(device)
+        labels = batch["labels"].to(device)
+    else:
+        ids    = batch.to(device)
+        labels = ids
+    return ids, labels
+
+
 def eval_ppl(model, loader, device, n_iter) -> float:
     orig = model.cfg.n_iter
     model.cfg.n_iter = n_iter
@@ -59,12 +75,17 @@ def eval_ppl(model, loader, device, n_iter) -> float:
     total_loss, total_tok = 0.0, 0
     with torch.no_grad():
         for batch in loader:
-            ids = batch.to(device)
-            out = model(input_ids=ids, labels=ids)
-            n   = (ids.shape[1] - 1) * ids.shape[0]
+            ids, labels = _unpack_batch(batch, device)
+            out = model(input_ids=ids, labels=labels)
+            # Count non-masked label tokens (shift by 1 like the model does)
+            n = (labels[:, 1:] != -100).sum().item()
+            if n == 0:
+                continue
             total_loss += out.loss.item() * n
             total_tok  += n
     model.cfg.n_iter = orig
+    if total_tok == 0:
+        return float("inf")
     return math.exp(min(total_loss / total_tok, 20))
 
 
@@ -95,15 +116,30 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    train_ds = load_text_dataset(tokenizer, max_length=args.seq_len,
-                                 split="train",
-                                 max_samples=args.max_samples)
-    eval_ds  = load_text_dataset(tokenizer, max_length=args.seq_len,
-                                 split="validation",
-                                 max_samples=50)
+    if args.dataset_type == "instruction":
+        train_ds = load_instruction_dataset(
+            tokenizer,
+            dataset_name = args.dataset,
+            split        = "train[:-500]",
+            max_length   = args.seq_len,
+            max_samples  = args.max_samples,
+        )
+        eval_ds = load_instruction_dataset(
+            tokenizer,
+            dataset_name = args.dataset,
+            split        = "train[-500:]",
+            max_length   = args.seq_len,
+            max_samples  = 50,
+        )
+    else:
+        train_ds = load_text_dataset(tokenizer, max_length=args.seq_len,
+                                     split="train",
+                                     max_samples=args.max_samples)
+        eval_ds  = load_text_dataset(tokenizer, max_length=args.seq_len,
+                                     split="validation",
+                                     max_samples=50)
     train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,  drop_last=True)
     eval_dl  = DataLoader(eval_ds,  batch_size=args.batch_size, shuffle=False)
-
     optimizer = torch.optim.AdamW(model.trainable_parameters(),
                                   lr=args.lr, betas=(0.9, 0.95), weight_decay=0.01)
     scheduler = get_cosine_schedule_with_warmup(optimizer, args.warmup_steps, args.max_steps)
@@ -111,7 +147,10 @@ def main():
     # True baseline: n_iter=0 sau Bug5 fix = all 28 layers = HF model gốc
     baseline_ppl = eval_ppl(model, eval_dl, device, n_iter=0)
     print(f"\nBaseline PPL (n_iter=0, all 28 layers): {baseline_ppl:.2f}")
-    print(f"  (Expected ~8-15 for Qwen3-1.7B on WikiText-2)\n")
+    if args.dataset_type == "text":
+        print(f"  (Expected ~8-15 for Qwen3-1.7B on WikiText-2)\n")
+    else:
+        print(f"  (Instruction dataset — PPL reflects chat-format perplexity)\n")
 
     best_ppl, step, log_loss = float("inf"), 0, 0.0
     data_iter = iter(train_dl)
@@ -133,9 +172,9 @@ def main():
         model.train()
         model.connect.train()
 
-        ids = batch.to(device)
+        ids, labels = _unpack_batch(batch, device)
         optimizer.zero_grad()
-        out = model(input_ids=ids, labels=ids)
+        out = model(input_ids=ids, labels=labels)
         out.loss.backward()
         torch.nn.utils.clip_grad_norm_(model.trainable_parameters(), args.grad_clip)
         optimizer.step()
