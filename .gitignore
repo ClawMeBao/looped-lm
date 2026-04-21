@@ -19,6 +19,7 @@ checkpoints/*.pt
 checkpoints/*.bin
 checkpoints/*.safetensors
 !checkpoints/.gitkeep
+*.pt
 
 # Data / cache
 *.jsonl

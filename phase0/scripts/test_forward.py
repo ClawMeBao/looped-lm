@@ -64,7 +64,12 @@ def main():
     connect_ok = all(p.grad is not None for p in model.connect.parameters())
     print(f"✅ Connect grads: {'ALL present' if connect_ok else '❌ MISSING'}")
 
-    frozen_with_grad = [n for n, p in model.bb.layers.named_parameters() if p.grad is not None]
+    frozen_modules = [model.prefix_layers, model.loop_layers, model.suffix_layers,
+                      model.embed_tokens, model.norm, model.lm_head]
+    frozen_with_grad = [
+        n for m in frozen_modules
+        for n, p in m.named_parameters() if p.grad is not None
+    ]
     if frozen_with_grad:
         print(f"⚠️  {len(frozen_with_grad)} frozen params leaked gradient!")
     else:
@@ -73,10 +78,7 @@ def main():
     # Gate stats for gated connect
     if args.connect_type == "gated":
         with torch.no_grad():
-            dummy = torch.randn(1, 8, cfg.loop_start * 2 or 2048,
-                                device=device, dtype=dtype)
-            # gate_stats needs matching d_model
-            dummy = torch.randn(1, 8, model.bb.d_model, device=device, dtype=dtype)
+            dummy = torch.randn(1, 8, model._d_model, device=device, dtype=dtype)
             stats = model.connect.gate_stats(dummy)
         print(f"\nGate stats at init:")
         for k, v in stats.items():
