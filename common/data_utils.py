@@ -4,10 +4,29 @@ common/data_utils.py — Dataset utilities dùng chung cho tất cả các phase
 
 from __future__ import annotations
 
+import re
 from typing import Optional
 
 import torch
 from torch.utils.data import Dataset, Subset
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _strip_think_tags(text: str) -> str:
+    """Remove <think>...</think> blocks (GLM / Qwen3 reasoning) from text."""
+    return re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL).strip()
+
+
+def _normalize_sharegpt(conversations: list[dict]) -> list[dict]:
+    """Convert ShareGPT from/value format → standard role/content format."""
+    role_map = {"human": "user", "gpt": "assistant", "system": "system"}
+    return [
+        {"role": role_map.get(m["from"], m["from"]), "content": m.get("value", "")}
+        for m in conversations
+    ]
 
 
 class TokenizedTextDataset(Dataset):
@@ -81,30 +100,48 @@ def _build_chat_example(
     tokenizer,
     messages: list[dict],
     max_length: int,
+    no_think: bool = False,
 ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
     """
     Tokenize một conversation với label mask: loss chỉ tính trên assistant tokens.
 
-    Với Qwen3 template, assistant turn có format:
+    Với Qwen3 template (thinking enabled, mặc định):
         <|im_start|>assistant\n<think>\n{reasoning}\n</think>\n\n{answer}<|im_end|>
 
-    Nếu message có field 'reasoning', inject vào content trước khi apply template.
+    Với no_think=True:
+        - Strip <think>...</think> khỏi content
+        - Pass enable_thinking=False vào apply_chat_template (Qwen3-specific)
+
     Unknown fields (e.g. 'reasoning', 'metadata') bị strip trước apply_chat_template.
 
     Returns (input_ids, labels) tensors or None nếu không có assistant token.
     """
-    # Strip unknown fields; inject reasoning into content if present
+    template_kwargs: dict = {}
+    if no_think:
+        template_kwargs["enable_thinking"] = False
+
+    # Normalise messages: strip unknown fields, inject reasoning or strip think
     clean_msgs = []
     for m in messages:
         content = m.get("content", "") or ""
-        if m.get("role") == "assistant" and m.get("reasoning"):
-            content = f"<think>\n{m['reasoning']}\n</think>\n\n{content}"
-        clean_msgs.append({"role": m["role"], "content": content})
+        role = m["role"]
+        if role == "assistant":
+            if no_think:
+                content = _strip_think_tags(content)
+            elif m.get("reasoning"):
+                content = f"<think>\n{m['reasoning']}\n</think>\n\n{content}"
+        clean_msgs.append({"role": role, "content": content})
 
     # Full sequence text
-    full_text = tokenizer.apply_chat_template(
-        clean_msgs, tokenize=False, add_generation_prompt=False
-    )
+    try:
+        full_text = tokenizer.apply_chat_template(
+            clean_msgs, tokenize=False, add_generation_prompt=False, **template_kwargs
+        )
+    except Exception:
+        # Fallback: tokenizer may not support enable_thinking kwarg
+        full_text = tokenizer.apply_chat_template(
+            clean_msgs, tokenize=False, add_generation_prompt=False
+        )
     full_ids = tokenizer(full_text, add_special_tokens=False)["input_ids"]
 
     # Truncate to max_length
@@ -115,17 +152,23 @@ def _build_chat_example(
     for i, msg in enumerate(clean_msgs):
         if msg["role"] != "assistant":
             continue
-        # Prefix ends at the start of this assistant's content (after im_start\nassistant\n)
-        prefix_text = tokenizer.apply_chat_template(
-            clean_msgs[:i], tokenize=False, add_generation_prompt=True
-        )
-        prefix_ids = tokenizer(prefix_text, add_special_tokens=False)["input_ids"]
+        try:
+            prefix_text = tokenizer.apply_chat_template(
+                clean_msgs[:i], tokenize=False, add_generation_prompt=True, **template_kwargs
+            )
+            end_text = tokenizer.apply_chat_template(
+                clean_msgs[: i + 1], tokenize=False, add_generation_prompt=False, **template_kwargs
+            )
+        except Exception:
+            prefix_text = tokenizer.apply_chat_template(
+                clean_msgs[:i], tokenize=False, add_generation_prompt=True
+            )
+            end_text = tokenizer.apply_chat_template(
+                clean_msgs[: i + 1], tokenize=False, add_generation_prompt=False
+            )
 
-        # End of this turn
-        end_text = tokenizer.apply_chat_template(
-            clean_msgs[: i + 1], tokenize=False, add_generation_prompt=False
-        )
-        end_ids = tokenizer(end_text, add_special_tokens=False)["input_ids"]
+        prefix_ids = tokenizer(prefix_text, add_special_tokens=False)["input_ids"]
+        end_ids    = tokenizer(end_text,   add_special_tokens=False)["input_ids"]
 
         start = len(prefix_ids)
         end   = min(len(end_ids), max_length)
@@ -156,6 +199,7 @@ class ChatDataset(Dataset):
         tokenizer,
         messages_list: list[list[dict]],
         max_length: int = 512,
+        no_think: bool = False,
     ):
         self.max_length    = max_length
         self.pad_token_id  = tokenizer.pad_token_id or tokenizer.eos_token_id or 0
@@ -163,7 +207,7 @@ class ChatDataset(Dataset):
 
         skipped = 0
         for messages in messages_list:
-            result = _build_chat_example(tokenizer, messages, max_length)
+            result = _build_chat_example(tokenizer, messages, max_length, no_think=no_think)
             if result is not None:
                 self.examples.append(result)
             else:
@@ -193,9 +237,10 @@ class ChatDataset(Dataset):
 def load_instruction_dataset(
     tokenizer,
     dataset_name: str = "Roman1111111/claude-opus-4.6-10000x",
-    split: str = "train[:-500]",
+    split: str = "train",
     max_length: int = 512,
     max_samples: Optional[int] = None,
+    no_think: bool = False,
 ) -> Dataset:
     """
     Load instruction-following dataset và build ChatDataset với chat template.
@@ -203,11 +248,10 @@ def load_instruction_dataset(
     Dataset mặc định: Roman1111111/claude-opus-4.6-10000x
       - Columns: messages (list[dict]), metadata
       - Assistant messages có extra field 'reasoning' (chain-of-thought)
-      - Format: [system, user, assistant{content, reasoning}]
 
-    split hỗ trợ HuggingFace slice syntax:
-      - "train[:-500]"   → training split (bỏ 500 cuối làm eval)
-      - "train[-500:]"   → eval split
+    Caller chịu trách nhiệm split train/eval/test (dùng random_split).
+
+    no_think=True: không inject reasoning → train on answer-only.
     """
     from datasets import load_dataset
 
@@ -217,7 +261,71 @@ def load_instruction_dataset(
     if max_samples is not None:
         messages_list = messages_list[:max_samples]
 
-    print(f"[data] Loaded {dataset_name} ({split}): {len(messages_list)} conversations")
-    dataset = ChatDataset(tokenizer, messages_list, max_length=max_length)
+    think_tag = " [no_think]" if no_think else " [think]"
+    print(f"[data] Loaded {dataset_name} ({split}){think_tag}: {len(messages_list)} conversations")
+    dataset = ChatDataset(tokenizer, messages_list, max_length=max_length, no_think=no_think)
+    print(f"[data] ChatDataset: {len(dataset)} valid examples × {max_length} tokens")
+    return dataset
+
+
+def load_glm_dataset(
+    tokenizer,
+    dataset_name: str = "Jackrong/GLM-5.1-Reasoning-1M-Cleaned",
+    split: str = "train",
+    max_length: int = 512,
+    max_samples: Optional[int] = None,
+    no_think: bool = False,
+    local_dir: str = "data/glm_dataset",
+) -> Dataset:
+    """
+    Load GLM-5.1 reasoning dataset (ShareGPT format) và build ChatDataset.
+
+    Dataset: Jackrong/GLM-5.1-Reasoning-1M-Cleaned (~1M rows, single train split)
+      - Columns: id, conversations, input, output, domain, meta
+      - conversations: [{from: human, value: ...}, {from: gpt, value: <think>…</think>\\n\\nanswer}]
+
+    Caching: lần đầu tải từ HuggingFace và lưu vào local_dir (Arrow format).
+    Lần sau load từ local_dir nếu tồn tại → không cần internet.
+
+    Khuyến nghị: dùng --max_samples để giới hạn với 1M-row dataset.
+    Caller chịu trách nhiệm split train/eval/test.
+
+    no_think=True: strip <think>...</think> từ gpt responses.
+    """
+    import os
+    from datasets import load_dataset, load_from_disk
+
+    def _is_dataset_dir(path: str) -> bool:
+        """Check nếu path là valid Arrow Dataset dir (có dataset_info.json)."""
+        return os.path.isfile(os.path.join(path, "dataset_info.json"))
+
+    # Thử load theo thứ tự ưu tiên:
+    #   1. local_dir trực tiếp  (user save thẳng vào thư mục)
+    #   2. local_dir/split      (code tự tạo khi download)
+    local_split_dir = os.path.join(local_dir, split)
+    if _is_dataset_dir(local_dir):
+        print(f"[data] Loading GLM dataset from local cache: {local_dir}")
+        ds = load_from_disk(local_dir)
+    elif _is_dataset_dir(local_split_dir):
+        print(f"[data] Loading GLM dataset from local cache: {local_split_dir}")
+        ds = load_from_disk(local_split_dir)
+    else:
+        print(f"[data] Downloading {dataset_name} from HuggingFace …")
+        os.makedirs(local_split_dir, exist_ok=True)
+        ds = load_dataset(dataset_name, split=split)
+        print(f"[data] Saving to local cache: {local_split_dir}")
+        ds.save_to_disk(local_split_dir)
+        print(f"[data] ✓ Saved {len(ds)} rows → {local_split_dir}")
+
+    messages_list: list[list[dict]] = [
+        _normalize_sharegpt(row["conversations"]) for row in ds
+    ]
+
+    if max_samples is not None:
+        messages_list = messages_list[:max_samples]
+
+    think_tag = " [no_think]" if no_think else " [think]"
+    print(f"[data] Loaded {dataset_name} ({split}){think_tag}: {len(messages_list)} conversations")
+    dataset = ChatDataset(tokenizer, messages_list, max_length=max_length, no_think=no_think)
     print(f"[data] ChatDataset: {len(dataset)} valid examples × {max_length} tokens")
     return dataset
