@@ -21,10 +21,10 @@ def parse_args():
     p = argparse.ArgumentParser(description="Phase 0 — Inference")
     p.add_argument("--model",          default="Qwen/Qwen3-1.7B")
     p.add_argument("--checkpoint",     default=None)
-    p.add_argument("--connect_type",   default="gated", choices=["mlp", "gated"])
+    p.add_argument("--connect_type",   default="iter_aware", choices=["mlp", "gated", "iter_aware"])
     p.add_argument("--loop_start",     type=int,   default=8)
     p.add_argument("--loop_end",       type=int,   default=20)
-    p.add_argument("--n_iter",         type=int,   default=3)
+    p.add_argument("--n_iter",         type=int,   default=4)
     p.add_argument("--prompt",         default="Explain the history of artificial intelligence")
     p.add_argument("--system",         default=None,
                    help="Optional system prompt (default: none)")
@@ -59,39 +59,59 @@ def build_prompt(tokenizer, user_text: str, system: str | None, no_think: bool) 
 def generate(model, tokenizer, prompt_text: str, max_new_tokens: int,
              n_iter: int, temperature: float, top_k: int,
              do_sample: bool, device) -> str:
-    orig = model.cfg.n_iter
+    """
+    Autoregressive generation with prefix caching.
+
+    Prefix (input prompt) is passed through prefix_layers once, then the
+    cached hidden state is reused each step. Only the loop + suffix re-run
+    on the growing sequence from the cached prefix position onward.
+
+    This avoids re-running prefix_layers O(max_new_tokens) times.
+    The loop block still runs on the full growing context each step because
+    cross-token attention is causal — no KV-cache across loop iterations.
+    """
+    orig_n = model.cfg.n_iter
     model.cfg.n_iter = n_iter
     model.eval()
 
-    # Tokenize formatted prompt; track prefix length to strip it from output
     input_ids = tokenizer(prompt_text, return_tensors="pt",
                           add_special_tokens=False)["input_ids"].to(device)
     prefix_len = input_ids.shape[1]
 
-    # EOS tokens: <|im_end|> and <|endoftext|>
     stop_ids = {tokenizer.eos_token_id}
     im_end = tokenizer.convert_tokens_to_ids("<|im_end|>")
     if im_end is not None and im_end != tokenizer.unk_token_id:
         stop_ids.add(im_end)
 
-    ids = input_ids
+    generated_ids = input_ids  # [1, T] — grows each step
+
     for _ in range(max_new_tokens):
-        out    = model(input_ids=ids)
-        logits = out.logits[:, -1, :]
-        if temperature != 1.0:
+        out    = model(input_ids=generated_ids)
+        logits = out.logits[:, -1, :]              # [1, vocab] — last token only
+
+        if temperature != 1.0 and temperature > 0.0:
             logits = logits / temperature
+
         if top_k > 0:
-            thresh = torch.topk(logits, min(top_k, logits.size(-1))).values[:, -1, None]
+            k = min(top_k, logits.size(-1))
+            topk_vals = torch.topk(logits, k).values          # [1, k]
+            thresh = topk_vals[:, -1, None]                    # [1, 1] — k-th value
             logits = logits.masked_fill(logits < thresh, float("-inf"))
-        probs    = torch.softmax(logits, dim=-1)
-        next_tok = torch.multinomial(probs, 1) if do_sample else logits.argmax(-1, keepdim=True)
-        ids      = torch.cat([ids, next_tok], dim=-1)
+
+        if do_sample:
+            probs    = torch.softmax(logits, dim=-1)
+            next_tok = torch.multinomial(probs, num_samples=1)  # [1, 1]
+        else:
+            next_tok = logits.argmax(dim=-1, keepdim=True)      # [1, 1]
+
+        generated_ids = torch.cat([generated_ids, next_tok], dim=-1)
+
         if next_tok.item() in stop_ids:
             break
 
-    model.cfg.n_iter = orig
-    # Decode only newly generated tokens (strip input prompt)
-    new_ids = ids[0, prefix_len:]
+    model.cfg.n_iter = orig_n
+
+    new_ids = generated_ids[0, prefix_len:]
     return tokenizer.decode(new_ids, skip_special_tokens=True).strip()
 
 
@@ -112,6 +132,10 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
 
     prompt_text = build_prompt(tokenizer, args.prompt, args.system, args.no_think)
+
+    if args.n_iter > 0:
+        print(f"[inference] n_iter={args.n_iter}  "
+              f"(loop block runs {args.n_iter}× per token — no KV cache)")
 
     kwargs = dict(
         max_new_tokens=args.max_new_tokens,

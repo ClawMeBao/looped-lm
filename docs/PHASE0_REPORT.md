@@ -450,3 +450,106 @@ eval_ds  = load_text_dataset(tokenizer, max_length=args.seq_len,
 ---
 
 *Experiment D added. Data leakage bug documented.*
+
+---
+
+## Experiment E — IterationAwareConnectLayer + Multi-step Aux Loss (Phase 0 Optimization)
+
+### Motivation
+
+Root-cause analysis of Phase 0 poor training (comparing against Ouro 1.4B paper, arxiv 2510.25741):
+
+| Root Cause | Old Behavior | Fix |
+|---|---|---|
+| Scalar gate `[B,S,1]` | Too coarse — same blend ratio for all d_model dims | Channel-wise gate `[B,S,d]` |
+| No iteration awareness | Connect doesn't know which loop step it's on | `iter_emb = nn.Embedding(8, d_model)` |
+| No input normalization | Hidden states arrive at arbitrary scale between iterations | Pre-norm on both `h_j` and `h_prev` |
+| Single-iter loss | Only final iteration contributes → thin gradient to connect | Multi-step aux loss at every iteration |
+| LR 3e-4 too high | Recurrent architectures need lower LR (Ouro paper explicitly warns) | Default `lr = 1e-4` |
+
+---
+
+### Architecture — `IterationAwareConnectLayer` (Option D, ~12M params)
+
+```python
+h_j_n    = pre_norm_j(h_j) + iter_emb[step_idx]      # normalize + inject iter context
+h_prev_n = pre_norm_prev(h_prev)                       # normalize previous hidden state
+gate     = sigmoid(gate_proj(cat([h_j_n, h_prev_n]))) # [B,S,d] — per-dim channel-wise gate
+blended  = gate * transform(h_j_n) + (1 - gate) * h_prev_n
+output   = post_norm(blended)
+```
+
+**Init:** `transform` near-zero (safe warm-start), `gate` bias → 0.5 (neutral start), `iter_emb` small random.
+
+---
+
+### Multi-step Auxiliary Loss
+
+```
+L_total = L_final + aux_loss_weight × Σ_i [ γ^(n-1-i) × CE(lm_head(norm(h_out_i)), labels) ]
+```
+
+- Geometric decay `γ = 0.5` → earlier iterations contribute less (natural curriculum)
+- `lm_head` + `norm` frozen but gradients flow back to connect layer
+- Based on Ouro Section 3.1 — expected task loss across all exit steps
+- Default: `aux_loss_weight = 0.3`, off by setting to `0.0`
+
+---
+
+### New Phase0Config Defaults
+
+| Field | Old | New |
+|---|---|---|
+| `n_iter` | 3 | 4 |
+| `connect_type` | `gated` | `iter_aware` |
+| `lr` (train.py) | 3e-4 | 1e-4 |
+| `aux_loss_weight` | — | 0.3 |
+| `aux_loss_gamma` | — | 0.5 |
+| `consistency_weight` | — | 0.0 (opt-in) |
+
+---
+
+### Smoke Test Result
+
+```
+python phase0/scripts/test_forward.py
+```
+
+```
+IterationAwareConnectLayer summary:
+  d_model : 2048
+  d_inner : 512
+  max_iter: 8
+  Trainable params: 10,510,337
+
+✅ Forward OK   loss=15.5781  logits=[1, 32, 151936]
+✅ Backward OK
+✅ Connect grads: ALL present
+✅ Frozen backbone: no gradient (correct)
+```
+
+**Status: ✅ PASS** — 10.5M trainable params, all gradients flowing correctly.
+
+---
+
+### Recommended Training Command
+
+```bash
+python phase0/scripts/train.py \
+    --connect_type iter_aware \
+    --n_iter 4 \
+    --lr 1e-4 \
+    --max_steps 3000 \
+    --curriculum \
+    --aux_loss_weight 0.3 \
+    --aux_loss_gamma 0.5 \
+    --max_samples 1500 \
+    --batch_size 2 \
+    --seq_len 256
+```
+
+Note: use `split="train"` in `load_text_dataset` (see Experiment D data leakage fix) before running.
+
+---
+
+*Experiment E: IterationAwareConnectLayer + multi-step aux loss. Smoke test ✅. Training results pending.*

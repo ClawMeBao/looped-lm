@@ -131,7 +131,7 @@ C(h) = LayerNorm(
 
 ---
 
-### 3.3 Phương án C — Gated Residual *(Khuyến nghị làm trước)*
+### 3.3 Phương án C — Gated Residual
 
 ```python
 gate      = sigmoid(W_g @ h_j)           # [B, S, 1] — learned per token
@@ -151,19 +151,42 @@ output    = gate * transform + (1 - gate) * h_i_prev
 
 ---
 
-### 3.4 Phương án D — Iteration-Aware MLP
+### 3.4 Phương án D — Iteration-Aware Connect *(Current default — Phase 0 optimized)*
+
+Kết hợp Gated Residual + Iteration Embedding + Channel-wise gate + Pre/Post norm:
 
 ```python
-iter_emb = nn.Embedding(max_iter, d_model)   # 8 × 2048 = 16K params
-C(h, n)  = LayerNorm(MLP(h + iter_emb[n]))
+# Pre-norm cả 2 inputs → stable activation scale
+h_j_n    = pre_norm_j(h_j) + iter_emb[step_idx]   # [B, S, d]
+h_prev_n = pre_norm_prev(h_prev)                    # [B, S, d]
+
+# Channel-wise gate dùng CẢ HAI inputs
+gate     = sigmoid(gate_proj(cat([h_j_n, h_prev_n])))  # [B, S, d] — per-dim!
+transform = MLP(h_j_n)                                  # [B, S, d]
+
+blended  = gate * transform + (1 - gate) * h_prev_n
+output   = post_norm(blended)                           # [B, S, d]
+
+# iter_emb = nn.Embedding(8, d_model) — 16K params
 ```
+
+Cải tiến vs Phương án C:
+
+| Cải tiến | Lý do |
+|----------|-------|
+| Pre-norm trên `h_j` và `h_prev` | Scale activation ổn định giữa các iterations |
+| Iteration embedding | Gate biết đang ở loop step nào → context-aware blending |
+| Gate `[B,S,d]` thay vì `[B,S,1]` | Kiểm soát từng chiều riêng biệt, richer signal |
+| Gate nhận concat `[h_j, h_prev]` | Quyết định dựa trên cả output mới VÀ state cũ |
+| Post-norm output | Normalize trước khi feed vào loop block tiếp |
 
 | Tiêu chí | Đánh giá |
 |----------|----------|
-| Expressivity | ⭐⭐⭐⭐ Cao |
-| Iteration awareness | ✅ Biết đang ở iteration nào |
-| Params | ~6M + 16K |
-| Analogy | Như positional encoding nhưng cho "reasoning depth" |
+| Expressivity | ⭐⭐⭐⭐⭐ Rất cao |
+| Gradient flow | ✅✅ Tốt (residual + pre-norm) |
+| Training stability | ✅✅ Tốt hơn C nhờ pre-norm |
+| Iteration awareness | ✅ Đầy đủ |
+| Params | ~12M (d=2048, d_inner=512, max_iter=8) |
 
 ---
 
@@ -187,15 +210,15 @@ C(h) = h + alpha * (B @ (A @ h))
 
 ### 3.6 So sánh Connect Layer
 
-| Phương án | Expressivity | Gradient | Params | Khuyến nghị |
-|-----------|-------------|----------|--------|-------------|
-| A: Linear+Norm | ⭐⭐ | ✅ | 4M | Baseline only |
-| B: MLP Bottleneck | ⭐⭐⭐ | ✅ | 2M | Phase 1 start |
-| **C: Gated Residual** | **⭐⭐⭐⭐** | **✅✅** | **6M** | **✅ Ưu tiên** |
-| D: Iteration-Aware | ⭐⭐⭐⭐ | ✅✅ | 6M+ | ✅ Phase 2 |
-| E: LoRA | ⭐⭐ | ✅ | 262K | Minimal/ablation |
+| Phương án | Expressivity | Gradient | Stability | Params | Khuyến nghị |
+|-----------|-------------|----------|-----------|--------|-------------|
+| A: Linear+Norm | ⭐⭐ | ✅ | ✅ | 4M | Baseline only |
+| B: MLP Bottleneck | ⭐⭐⭐ | ✅ | ✅ | 2M | Ablation |
+| C: Gated Residual | ⭐⭐⭐⭐ | ✅✅ | ✅ | 6M | Legacy (Phase 0 original) |
+| **D: Iteration-Aware** | **⭐⭐⭐⭐⭐** | **✅✅** | **✅✅** | **~12M** | **✅ Default (Phase 0+)** |
+| E: LoRA | ⭐⭐ | ✅ | ✅✅ | 262K | Minimal/ablation |
 
-**Best combo (Phase 2):** C + D = Gated Residual + Iteration Embedding
+**Current default: D** — `--connect_type iter_aware` in all train/eval scripts.
 
 ---
 
@@ -440,20 +463,21 @@ for n in range(N):
 
 ---
 
-### Option 2 — "Balanced" *(Khuyến nghị)*
+### Option 2 — "Balanced" *(Khuyến nghị — Phase 1)*
 
 **Thành phần:**
 | Component | Lựa chọn |
 |-----------|----------|
-| Connect Layer | Gated Residual + MLP (Phương án C) |
+| Connect Layer | **Iteration-Aware Connect (Phương án D)** |
 | Linear Attn State | Reset (an toàn) |
-| Exit Gate signals | h_15 + delta + iter_emb (S1 + S3 + S5) |
+| Exit Gate signals | h_loop_out + delta + iter_emb (S1 + S3 + S5) |
 | Gate differentiability | Soft (train) / Hard (infer) |
 | Gate granularity | Per-sequence |
-| Training signal | Ponder + Consistency |
+| Training signal | LM Loss + Ponder + Consistency |
+| Aux loss | Multi-step per-iter CE (aux_loss_weight=0.3) |
 | Gradient | Truncated BPTT, K=3 |
 
-**Params trainable:** ~8M
+**Params trainable:** ~13M (12M connect + 1M gate)
 
 **Ưu điểm:**
 - Gated Residual đảm bảo gradient flow ổn định và tránh catastrophic forgetting iteration trước
@@ -552,21 +576,20 @@ for n in range(N):
 ## 11. Lộ trình đề xuất
 
 ```
-Phase 0 (1 tuần): Option 4 — No-Gate PoC
-    └── Mục tiêu: Xác nhận loop block L8–L15 hoạt động
-    └── Metric: perplexity với N=1,2,3,4 so với baseline
+Phase 0 (done): Option 4 → upgraded to Option 2 connect layer
+    └── No-Gate PoC: xác nhận loop block hoạt động
+    └── IterationAwareConnectLayer + multi-step aux loss (Ouro-inspired)
+    └── New defaults: n_iter=4, lr=1e-4, connect_type=iter_aware
+    └── Metric: perplexity vs baseline (n_iter=0)
 
-Phase 1 (2 tuần): Option 1 — Safe Start
+Phase 1 (current): Exit Gate — soft→hard
     └── Mục tiêu: Thêm exit gate, verify training signal
+    └── Dùng lại connect layer từ Phase 0 (warm-start)
     └── Metric: iterations/sample, accuracy vs speed trade-off
 
-Phase 2 (3 tuần): Option 2 — Balanced
-    └── Mục tiêu: Full pipeline production-quality
+Phase 2 (planned): Full pipeline production-quality
+    └── Mục tiêu: LoRA unfreeze loop block + iteration-aware attention
     └── Metric: benchmark trên reasoning tasks (GSM8K, ARC...)
-
-Phase 3 (optional): Option 3 — Full Power
-    └── Nếu Phase 2 cho kết quả tốt
-    └── Cần thêm GPU resource và experiment budget
 ```
 
 ---

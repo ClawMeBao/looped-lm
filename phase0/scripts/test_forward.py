@@ -16,8 +16,8 @@ from phase0.src import Phase0Model, Phase0Config
 def parse_args():
     p = argparse.ArgumentParser(description="Phase 0 — Smoke Test")
     p.add_argument("--model",        default="Qwen/Qwen3-1.7B")
-    p.add_argument("--connect_type", default="gated", choices=["mlp", "gated"])
-    p.add_argument("--n_iter",       type=int, default=3)
+    p.add_argument("--connect_type", default="iter_aware", choices=["mlp", "gated", "iter_aware"])
+    p.add_argument("--n_iter",       type=int, default=4)
     p.add_argument("--loop_start",   type=int, default=8)
     p.add_argument("--loop_end",     type=int, default=20)
     p.add_argument("--seq_len",      type=int, default=32)

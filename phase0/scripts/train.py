@@ -26,10 +26,10 @@ from common.data_utils import load_text_dataset, load_instruction_dataset, load_
 def parse_args():
     p = argparse.ArgumentParser(description="Phase 0 — Train connect layer")
     p.add_argument("--model",          default="Qwen/Qwen3-1.7B")
-    p.add_argument("--connect_type",   default="gated", choices=["mlp", "gated"])
+    p.add_argument("--connect_type",   default="iter_aware", choices=["mlp", "gated", "iter_aware"])
     p.add_argument("--loop_start",     type=int,   default=8)
     p.add_argument("--loop_end",       type=int,   default=20)
-    p.add_argument("--n_iter",         type=int,   default=3)
+    p.add_argument("--n_iter",         type=int,   default=4)
     p.add_argument("--epochs",         type=int,   default=3,
                    help="Number of training epochs")
     p.add_argument("--eval_every",     type=int,   default=1,
@@ -38,11 +38,17 @@ def parse_args():
                    help="Log to TensorBoard every N global steps")
     p.add_argument("--batch_size",     type=int,   default=2)
     p.add_argument("--seq_len",        type=int,   default=1024)
-    p.add_argument("--lr",             type=float, default=3e-4)
+    p.add_argument("--lr",             type=float, default=1e-4)
     p.add_argument("--warmup_ratio",   type=float, default=0.05,
                    help="Fraction of total steps for LR warmup")
     p.add_argument("--grad_clip",      type=float, default=1.0)
     p.add_argument("--k_bptt",         type=int,   default=2)
+    p.add_argument("--aux_loss_weight",  type=float, default=0.3,
+                   help="Weight of summed per-iteration auxiliary LM losses (0=disabled)")
+    p.add_argument("--aux_loss_gamma",   type=float, default=0.5,
+                   help="Geometric decay for earlier iterations in auxiliary loss")
+    p.add_argument("--consistency_weight", type=float, default=0.05,
+                   help="L2 convergence regularizer between loop iterations (0=disabled)")
     p.add_argument("--curriculum",     action="store_true",
                    help="Ramp n_iter from 1 -> n_iter across epochs")
     p.add_argument("--max_samples",    type=int,   default=None,
@@ -142,6 +148,9 @@ def main():
         n_iter       = args.n_iter,
         connect_type = args.connect_type,
         k_bptt       = args.k_bptt,
+        aux_loss_weight    = args.aux_loss_weight,
+        aux_loss_gamma     = args.aux_loss_gamma,
+        consistency_weight = args.consistency_weight,
     )
     model  = Phase0Model.from_pretrained(cfg, torch_dtype=dtype)
     device = next(model.connect.parameters()).device

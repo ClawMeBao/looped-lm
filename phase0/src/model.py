@@ -29,7 +29,7 @@ import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from common.backbone import BackboneComponents, load_backbone
-from common.connect_layer import MLPConnectLayer, GatedResidualConnectLayer
+from common.connect_layer import MLPConnectLayer, GatedResidualConnectLayer, IterationAwareConnectLayer
 
 
 # ---------------------------------------------------------------------------
@@ -40,13 +40,18 @@ from common.connect_layer import MLPConnectLayer, GatedResidualConnectLayer
 class Phase0Config:
     """Config cho Phase 0 — fixed-iteration loop, no exit gate."""
 
-    model_name:       str            = "Qwen/Qwen3-1.7B"
-    loop_start:       int            = 8
-    loop_end:         int            = 20
-    n_iter:           int            = 3
-    connect_type:     str            = "gated"   # "mlp" | "gated"
-    bottleneck_ratio: float          = 0.25
-    k_bptt:           Optional[int]  = 2         # None = full unroll
+    model_name:           str            = "Qwen/Qwen3-1.7B"
+    loop_start:           int            = 8
+    loop_end:             int            = 20
+    n_iter:               int            = 4
+    connect_type:         str            = "iter_aware"   # "mlp" | "gated" | "iter_aware"
+    bottleneck_ratio:     float          = 0.25
+    k_bptt:               Optional[int]  = 2         # None = full unroll
+    # Auxiliary multi-step loss (from Ouro paper Section 3.1)
+    aux_loss_weight:      float          = 0.3   # weight of summed per-iter losses
+    aux_loss_gamma:       float          = 0.5   # geometric decay: earlier iters weighted less
+    # Optional convergence regularizer
+    consistency_weight:   float          = 0.0   # L2 ||h_out_i - h_out_{i-1}||² / d
 
     def validate(self, num_layers: int):
         assert 0 <= self.loop_start < self.loop_end <= num_layers, (
@@ -94,7 +99,9 @@ class Phase0Model(nn.Module):
         self._backbone_config         = bb.config
 
         # Connect layer (ONLY trainable component)
-        if cfg.connect_type == "gated":
+        if cfg.connect_type == "iter_aware":
+            self.connect = IterationAwareConnectLayer(bb.d_model, cfg.bottleneck_ratio)
+        elif cfg.connect_type == "gated":
             self.connect = GatedResidualConnectLayer(bb.d_model, cfg.bottleneck_ratio)
         else:
             self.connect = MLPConnectLayer(bb.d_model, cfg.bottleneck_ratio)
@@ -190,6 +197,10 @@ class Phase0Model(nn.Module):
 
         # 5. Loop block × n_iter + connect layer (connect is trainable)
         h_prev = h
+        aux_losses: list[torch.Tensor] = []   # per-iteration LM losses for auxiliary signal
+        h_out_prev: Optional[torch.Tensor] = None
+        consistency_losses: list[torch.Tensor] = []
+
         for i in range(self.cfg.n_iter):
             # Truncated BPTT: detach h entering early iterations so gradient
             # doesn't flow through loop_block more than k_bptt times.
@@ -204,8 +215,28 @@ class Phase0Model(nn.Module):
             h_out = self._run_layers(h, self.loop_layers,
                                      pos_emb, causal_mask, position_ids, cache_position)
 
+            # Auxiliary LM loss at each iteration (from Ouro paper Section 3.1)
+            # lm_head + norm are frozen but activations flow grad back to connect
+            if labels is not None and self.cfg.aux_loss_weight > 0.0:
+                h_norm_i = self.norm(h_out)
+                logits_i = self.lm_head(h_norm_i)
+                loss_i = nn.CrossEntropyLoss(ignore_index=-100)(
+                    logits_i[..., :-1, :].contiguous().view(-1, logits_i.size(-1)),
+                    labels[..., 1:].contiguous().view(-1),
+                )
+                aux_losses.append(loss_i)
+
+            # Consistency loss: encourage hidden states to converge across iters
+            if labels is not None and self.cfg.consistency_weight > 0.0:
+                if h_out_prev is not None:
+                    diff = (h_out - h_out_prev.detach()).pow(2).mean()
+                    consistency_losses.append(diff)
+                h_out_prev = h_out
+
             # Connect layer (trainable)
-            if isinstance(self.connect, GatedResidualConnectLayer):
+            if isinstance(self.connect, IterationAwareConnectLayer):
+                h = self.connect(h_out, h_prev, step_idx=i)
+            elif isinstance(self.connect, GatedResidualConnectLayer):
                 h = self.connect(h_out, h_prev)
             else:
                 h = self.connect(h_out)
@@ -227,6 +258,20 @@ class Phase0Model(nn.Module):
                 logits[..., :-1, :].contiguous().view(-1, logits.size(-1)),
                 labels[..., 1:].contiguous().view(-1),
             )
+
+            # Auxiliary multi-step loss: geometric weighting, earlier iters less weight
+            # L_total = L_final + aux_weight * sum_i( gamma^(n-1-i) * L_i )
+            if aux_losses and self.cfg.aux_loss_weight > 0.0:
+                n = len(aux_losses)
+                aux_total = sum(
+                    (self.cfg.aux_loss_gamma ** (n - 1 - i)) * aux_losses[i]
+                    for i in range(n)
+                )
+                loss = loss + self.cfg.aux_loss_weight * aux_total
+
+            # Consistency loss
+            if consistency_losses and self.cfg.consistency_weight > 0.0:
+                loss = loss + self.cfg.consistency_weight * sum(consistency_losses)
 
         return CausalLMOutputWithPast(loss=loss, logits=logits)
 
@@ -277,6 +322,8 @@ class Phase0Model(nn.Module):
         print(f"  Connect type    : {self.cfg.connect_type}")
         print(f"  Loop block      : layers [{self.cfg.loop_start}, {self.cfg.loop_end})")
         print(f"  n_iter          : {self.cfg.n_iter}")
+        print(f"  aux_loss_weight : {self.cfg.aux_loss_weight}  (gamma={self.cfg.aux_loss_gamma})")
+        print(f"  consistency_w   : {self.cfg.consistency_weight}")
         print(f"  n_iter=0        : runs all {len(self.prefix_layers)+len(self.loop_layers)+len(self.suffix_layers)} layers (true baseline)")
 
     # -----------------------------------------------------------------------
