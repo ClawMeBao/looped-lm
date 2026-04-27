@@ -13,6 +13,9 @@ TensorBoard:
 import argparse, sys, os, math
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
+# Disable HuggingFace tokenizer parallelism to avoid deadlocks with multi-worker DataLoader
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 import torch
 from torch.utils.data import DataLoader, random_split
 from torch.utils.tensorboard import SummaryWriter
@@ -36,8 +39,12 @@ def parse_args():
                    help="Run eval split every N epochs")
     p.add_argument("--log_steps",      type=int,   default=10,
                    help="Log to TensorBoard every N global steps")
-    p.add_argument("--batch_size",     type=int,   default=2)
-    p.add_argument("--seq_len",        type=int,   default=1024)
+    p.add_argument("--save_every",     type=int,   default=100,
+                   help="Save a step checkpoint every N global steps (0=disabled)")
+    p.add_argument("--resume",         default=None,
+                   help="Path to a step checkpoint (.pt) to resume training from")
+    p.add_argument("--batch_size",     type=int,   default=4)
+    p.add_argument("--seq_len",        type=int,   default=512)
     p.add_argument("--lr",             type=float, default=1e-4)
     p.add_argument("--warmup_ratio",   type=float, default=0.05,
                    help="Fraction of total steps for LR warmup")
@@ -66,6 +73,8 @@ def parse_args():
                    help="'instruction': Roman claude; 'glm': GLM reasoning; 'text': plain blocks")
     p.add_argument("--no_think",       action="store_true",
                    help="Strip <think> reasoning -- train on answer-only")
+    p.add_argument("--num_workers",    type=int,   default=16,
+                   help="DataLoader worker processes (default: 16)")
     p.add_argument("--local_dataset_dir", default="data/glm_dataset",
                    help="Local dir to cache GLM dataset (Arrow format). "
                         "Auto-download if not found, then save for reuse.")
@@ -194,9 +203,21 @@ def main():
     print(f"\n[data] Split -> train: {len(train_ds)}  "
           f"eval: {len(eval_ds)}  test: {len(test_ds)}\n")
 
-    train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,  drop_last=True)
-    eval_dl  = DataLoader(eval_ds,  batch_size=args.batch_size, shuffle=False)
-    test_dl  = DataLoader(test_ds,  batch_size=args.batch_size, shuffle=False)
+    train_dl = DataLoader(
+        train_ds, batch_size=args.batch_size, shuffle=True, drop_last=True,
+        num_workers=args.num_workers, pin_memory=True,
+        persistent_workers=(args.num_workers > 0),
+    )
+    eval_dl  = DataLoader(
+        eval_ds, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, pin_memory=True,
+        persistent_workers=(args.num_workers > 0),
+    )
+    test_dl  = DataLoader(
+        test_ds, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, pin_memory=True,
+        persistent_workers=(args.num_workers > 0),
+    )
 
     steps_per_epoch = len(train_dl)
     total_steps     = args.epochs * steps_per_epoch
@@ -221,11 +242,24 @@ def main():
         print()
     writer.add_scalar("ppl/baseline", baseline_ppl, 0)
 
-    best_ppl    = float("inf")
-    global_step = 0
+    best_ppl       = float("inf")
+    global_step    = 0
+    start_epoch    = 1
+
+    # -- Resume from step checkpoint ---------------------------------------
+    if args.resume:
+        ckpt_data = torch.load(args.resume, map_location=device)
+        model.connect.load_state_dict(ckpt_data["connect"])
+        optimizer.load_state_dict(ckpt_data["optimizer"])
+        scheduler.load_state_dict(ckpt_data["scheduler"])
+        global_step = ckpt_data.get("global_step", 0)
+        start_epoch = ckpt_data.get("epoch", 1)
+        best_ppl    = ckpt_data.get("best_ppl", float("inf"))
+        print(f"[resume] Loaded checkpoint from '{args.resume}' "
+              f"(step={global_step}, epoch={start_epoch}, best_ppl={best_ppl:.2f})")
 
     # -- Training loop -----------------------------------------------------
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         model.connect.train()
 
@@ -266,6 +300,9 @@ def main():
                 lr=f"{scheduler.get_last_lr()[0]:.2e}",
             )
 
+            # Per-step loss (always logged for smooth curve)
+            writer.add_scalar("train/loss_step", loss_val, global_step)
+
             if global_step % args.log_steps == 0:
                 avg = log_loss / log_cnt
                 writer.add_scalar("train/loss",   avg,                        global_step)
@@ -273,6 +310,24 @@ def main():
                 writer.add_scalar("train/lr",     scheduler.get_last_lr()[0], global_step)
                 writer.add_scalar("train/n_iter", cur_n,                      global_step)
                 log_loss, log_cnt = 0.0, 0
+
+            if args.save_every > 0 and global_step % args.save_every == 0:
+                resume_ckpt = os.path.join(args.output_dir, "resume.pt")
+                tmp_ckpt    = resume_ckpt + ".tmp"
+                torch.save(
+                    {
+                        "connect":     model.connect.state_dict(),
+                        "optimizer":   optimizer.state_dict(),
+                        "scheduler":   scheduler.state_dict(),
+                        "global_step": global_step,
+                        "epoch":       epoch,
+                        "best_ppl":    best_ppl,
+                        "args":        vars(args),
+                    },
+                    tmp_ckpt,
+                )
+                os.replace(tmp_ckpt, resume_ckpt)  # atomic overwrite
+                print(f"  [ckpt] Resume checkpoint → {resume_ckpt}  (step {global_step})")
 
         pbar.close()
 

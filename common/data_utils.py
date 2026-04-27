@@ -188,6 +188,10 @@ class ChatDataset(Dataset):
     """
     Instruction-following dataset with per-turn label masking.
 
+    __init__ only filters and stores raw messages — no tokenization.
+    Tokenization happens lazily in __getitem__, making it safe to use
+    with multi-worker DataLoaders (num_workers > 0).
+
     Each example returns:
         {"input_ids": Tensor[max_length], "labels": Tensor[max_length]}
 
@@ -201,36 +205,52 @@ class ChatDataset(Dataset):
         max_length: int = 512,
         no_think: bool = False,
     ):
-        self.max_length    = max_length
-        self.pad_token_id  = tokenizer.pad_token_id or tokenizer.eos_token_id or 0
-        self.examples: list[tuple[torch.Tensor, torch.Tensor]] = []
+        self.tokenizer    = tokenizer
+        self.max_length   = max_length
+        self.no_think     = no_think
+        self.pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id or 0
 
+        # Cheap pre-filter: keep only conversations with at least one assistant turn.
+        # Full validity is checked lazily in __getitem__.
         skipped = 0
+        self.messages_list: list[list[dict]] = []
         for messages in messages_list:
-            result = _build_chat_example(tokenizer, messages, max_length, no_think=no_think)
-            if result is not None:
-                self.examples.append(result)
+            has_assistant = any(
+                m.get("role") == "assistant" or m.get("from") == "gpt"
+                for m in messages
+            )
+            if has_assistant:
+                self.messages_list.append(messages)
             else:
                 skipped += 1
 
         if skipped:
-            print(f"[data] Skipped {skipped} examples (no assistant tokens or too long)")
+            print(f"[data] Skipped {skipped} examples (no assistant turns)")
 
     def __len__(self) -> int:
-        return len(self.examples)
+        return len(self.messages_list)
 
     def __getitem__(self, idx: int) -> dict:
-        input_ids, labels = self.examples[idx]
-        pad_len = self.max_length - len(input_ids)
-        if pad_len > 0:
-            input_ids = torch.cat([
-                input_ids,
-                torch.full((pad_len,), self.pad_token_id, dtype=torch.long),
-            ])
-            labels = torch.cat([
-                labels,
-                torch.full((pad_len,), -100, dtype=torch.long),
-            ])
+        result = _build_chat_example(
+            self.tokenizer, self.messages_list[idx], self.max_length, no_think=self.no_think
+        )
+        if result is None:
+            # Edge case: assistant tokens all truncated — return all-pad sample
+            # (loss mask is all -100, so this sample contributes 0 gradient)
+            input_ids = torch.full((self.max_length,), self.pad_token_id, dtype=torch.long)
+            labels    = torch.full((self.max_length,), -100,              dtype=torch.long)
+        else:
+            input_ids, labels = result
+            pad_len = self.max_length - len(input_ids)
+            if pad_len > 0:
+                input_ids = torch.cat([
+                    input_ids,
+                    torch.full((pad_len,), self.pad_token_id, dtype=torch.long),
+                ])
+                labels = torch.cat([
+                    labels,
+                    torch.full((pad_len,), -100, dtype=torch.long),
+                ])
         return {"input_ids": input_ids, "labels": labels}
 
 
