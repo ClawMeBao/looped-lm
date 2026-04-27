@@ -96,6 +96,75 @@ def load_text_dataset(
 # ChatDataset — instruction-following dataset with chat template + label mask
 # ---------------------------------------------------------------------------
 
+def _get_assistant_token_ids(tokenizer):
+    """
+    Return (im_start_id, im_end_id, assistant_header_ids) for span detection.
+
+    assistant_header_ids = token IDs for 'assistant\\n' (without im_start).
+    These follow immediately after <|im_start|> in every assistant turn.
+    """
+    im_start_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
+    im_end_id   = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    # Tokenize 'assistant\n' without special tokens to get the header suffix
+    header_ids  = tokenizer("assistant\n", add_special_tokens=False)["input_ids"]
+    return im_start_id, im_end_id, header_ids
+
+
+def _find_assistant_spans(
+    full_ids: list[int],
+    im_start_id: int,
+    im_end_id: int,
+    header_ids: list[int],
+    skip_think_wrapper: bool = False,
+    think_id: int = 151667,
+    end_think_id: int = 151668,
+) -> list[tuple[int, int]]:
+    """
+    Scan full_ids for assistant turns and return (content_start, content_end) spans.
+
+    Pattern searched:  [im_start_id] + header_ids + [content...] + [im_end_id]
+    content_start: index of first content token (right after the header)
+    content_end:   index right after <|im_end|> (exclusive, includes im_end itself)
+
+    skip_think_wrapper=True: if the content starts with <think>...\n\n</think>\n\n,
+    advance content_start past it (used with no_think=True to train on answer only).
+    """
+    spans: list[tuple[int, int]] = []
+    h_len = len(header_ids)
+    i = 0
+    while i < len(full_ids):
+        # Match <|im_start|>assistant\n
+        if (full_ids[i] == im_start_id
+                and i + h_len < len(full_ids)
+                and full_ids[i + 1 : i + 1 + h_len] == header_ids):
+            content_start = i + 1 + h_len
+
+            # Optionally skip <think>...\n\n</think>\n\n boilerplate
+            if skip_think_wrapper and content_start < len(full_ids) and full_ids[content_start] == think_id:
+                # Scan for </think>
+                j = content_start + 1
+                while j < len(full_ids) and full_ids[j] != end_think_id:
+                    j += 1
+                if j < len(full_ids):  # found </think>
+                    j += 1  # skip </think>
+                    # skip trailing whitespace tokens (\n, \n\n etc.)
+                    while j < len(full_ids) and full_ids[j] not in (im_end_id, im_start_id) and full_ids[j] in (198, 271, 148, 220):
+                        j += 1
+                    content_start = j
+
+            # Walk forward to find matching <|im_end|>
+            j = content_start
+            while j < len(full_ids) and full_ids[j] != im_end_id:
+                j += 1
+            # Include <|im_end|> in the span
+            content_end = j + 1 if j < len(full_ids) else j
+            spans.append((content_start, content_end))
+            i = content_end
+        else:
+            i += 1
+    return spans
+
+
 def _build_chat_example(
     tokenizer,
     messages: list[dict],
@@ -105,14 +174,10 @@ def _build_chat_example(
     """
     Tokenize một conversation với label mask: loss chỉ tính trên assistant tokens.
 
-    Với Qwen3 template (thinking enabled, mặc định):
-        <|im_start|>assistant\n<think>\n{reasoning}\n</think>\n\n{answer}<|im_end|>
+    Span detection dùng token-ID pattern search (<|im_start|>assistant\\n … <|im_end|>)
+    thay vì re-tokenize prefix/end riêng lẻ — tránh BPE boundary mismatch.
 
-    Với no_think=True:
-        - Strip <think>...</think> khỏi content
-        - Pass enable_thinking=False vào apply_chat_template (Qwen3-specific)
-
-    Unknown fields (e.g. 'reasoning', 'metadata') bị strip trước apply_chat_template.
+    no_think=True: strip <think>…</think> từ content trước khi render template.
 
     Returns (input_ids, labels) tensors or None nếu không có assistant token.
     """
@@ -124,7 +189,7 @@ def _build_chat_example(
     clean_msgs = []
     for m in messages:
         content = m.get("content", "") or ""
-        role = m["role"]
+        role    = m["role"]
         if role == "assistant":
             if no_think:
                 content = _strip_think_tags(content)
@@ -132,46 +197,47 @@ def _build_chat_example(
                 content = f"<think>\n{m['reasoning']}\n</think>\n\n{content}"
         clean_msgs.append({"role": role, "content": content})
 
-    # Full sequence text
+    # Tokenize full sequence once via apply_chat_template
     try:
-        full_text = tokenizer.apply_chat_template(
-            clean_msgs, tokenize=False, add_generation_prompt=False, **template_kwargs
+        result = tokenizer.apply_chat_template(
+            clean_msgs,
+            tokenize=True,
+            add_generation_prompt=False,
+            add_special_tokens=False,
+            **template_kwargs,
         )
-    except Exception:
-        # Fallback: tokenizer may not support enable_thinking kwarg
-        full_text = tokenizer.apply_chat_template(
-            clean_msgs, tokenize=False, add_generation_prompt=False
-        )
-    full_ids = tokenizer(full_text, add_special_tokens=False)["input_ids"]
-
-    # Truncate to max_length
-    full_ids = full_ids[:max_length]
-    labels = [-100] * len(full_ids)
-
-    # For each assistant message: mark its tokens as loss targets
-    for i, msg in enumerate(clean_msgs):
-        if msg["role"] != "assistant":
-            continue
+    except TypeError:
+        # Older transformers: no add_special_tokens kwarg
         try:
-            prefix_text = tokenizer.apply_chat_template(
-                clean_msgs[:i], tokenize=False, add_generation_prompt=True, **template_kwargs
-            )
-            end_text = tokenizer.apply_chat_template(
-                clean_msgs[: i + 1], tokenize=False, add_generation_prompt=False, **template_kwargs
+            result = tokenizer.apply_chat_template(
+                clean_msgs, tokenize=True, add_generation_prompt=False, **template_kwargs
             )
         except Exception:
-            prefix_text = tokenizer.apply_chat_template(
-                clean_msgs[:i], tokenize=False, add_generation_prompt=True
-            )
-            end_text = tokenizer.apply_chat_template(
-                clean_msgs[: i + 1], tokenize=False, add_generation_prompt=False
+            result = tokenizer.apply_chat_template(
+                clean_msgs, tokenize=True, add_generation_prompt=False
             )
 
-        prefix_ids = tokenizer(prefix_text, add_special_tokens=False)["input_ids"]
-        end_ids    = tokenizer(end_text,   add_special_tokens=False)["input_ids"]
+    # apply_chat_template may return a BatchEncoding/dict or a plain list
+    if hasattr(result, "input_ids"):
+        full_ids: list[int] = list(result["input_ids"])
+    elif isinstance(result, dict):
+        full_ids = list(result["input_ids"])
+    else:
+        full_ids = list(result)
 
-        start = len(prefix_ids)
-        end   = min(len(end_ids), max_length)
+    # Truncate
+    full_ids = full_ids[:max_length]
+    labels   = [-100] * len(full_ids)
+
+    # Find and mark assistant spans using token-ID pattern search
+    im_start_id, im_end_id, header_ids = _get_assistant_token_ids(tokenizer)
+    spans = _find_assistant_spans(
+        full_ids, im_start_id, im_end_id, header_ids,
+        skip_think_wrapper=no_think,
+    )
+
+    for start, end in spans:
+        end = min(end, max_length)
         for j in range(start, end):
             labels[j] = full_ids[j]
 
