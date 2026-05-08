@@ -53,6 +53,8 @@ def parse_args():
                    help="Run eval split every N epochs (0=disabled; prefer --eval_steps)")
     p.add_argument("--eval_steps",     type=int,   default=250,
                    help="Run eval split every N optimizer steps (0=disabled)")
+    p.add_argument("--eval_max_batches", type=int, default=None,
+                   help="Limit eval batches for quick smoke runs (default: full eval split)")
     p.add_argument("--no_eval_all_iters", action="store_true",
                    help="Only eval target n_iter instead of n_iter=0..N")
     p.add_argument("--log_steps",      type=int,   default=20,
@@ -200,7 +202,9 @@ def eval_ppl(model, loader, device, n_iter, desc="Eval") -> tuple[float, float]:
     model.cfg.consistency_weight = 0.0
     model.eval()
     total_loss, total_tok = 0.0, 0
-    for batch in tqdm(loader, desc=desc, leave=False, unit="batch"):
+    for batch_idx, batch in enumerate(tqdm(loader, desc=desc, leave=False, unit="batch")):
+        if getattr(model, "_eval_max_batches", None) is not None and batch_idx >= model._eval_max_batches:
+            break
         ids, labels = _unpack_batch(batch, device)
         out = model(input_ids=ids, labels=labels)
         n   = (labels[:, 1:] != -100).sum().item()
@@ -226,6 +230,7 @@ def eval_suite(model, loader, device, args, baseline_ppl, writer, global_step: i
 
     target_loss, target_ppl = float("inf"), float("inf")
     best_iter, best_ppl = None, float("inf")
+    model._eval_max_batches = args.eval_max_batches
 
     for n_iter in eval_iters:
         loss, ppl = eval_ppl(model, loader, device, n_iter=n_iter,
@@ -246,6 +251,7 @@ def eval_suite(model, loader, device, args, baseline_ppl, writer, global_step: i
         writer.add_scalar("eval/best_n_iter", best_iter, global_step)
         writer.add_scalar("eval/best_ppl", best_ppl, global_step)
 
+    model._eval_max_batches = None
     return target_loss, target_ppl
 
 
@@ -349,7 +355,9 @@ def main():
     print(f"TensorBoard: tensorboard --logdir {log_dir}\n")
 
     # -- Baseline ----------------------------------------------------------
+    model._eval_max_batches = args.eval_max_batches
     baseline_loss, baseline_ppl = eval_ppl(model, eval_dl, device, n_iter=0, desc="Baseline")
+    model._eval_max_batches = None
     print(f"Baseline PPL (n_iter=0, all layers): {baseline_ppl:.2f}  loss={baseline_loss:.4f}")
     if args.dataset_type != "text":
         mode = "no-think" if args.no_think else "thinking"
@@ -532,8 +540,10 @@ def main():
 
     # -- Final validation on held-out test split ---------------------------
     print("\n" + "=" * 60)
+    model._eval_max_batches = args.eval_max_batches
     val_loss, val_ppl = eval_ppl(model, test_dl, device, n_iter=args.n_iter,
                                  desc="Final Validate")
+    model._eval_max_batches = None
     sign = "+" if val_ppl - baseline_ppl >= 0 else ""
     print(f"Final Validate  loss={val_loss:.4f}  PPL={val_ppl:.2f}  "
           f"({sign}{val_ppl-baseline_ppl:.2f} vs baseline={baseline_ppl:.2f})")
