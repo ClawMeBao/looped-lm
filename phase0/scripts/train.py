@@ -403,8 +403,13 @@ def main():
             unit="batch", dynamic_ncols=True,
         )
         for batch in pbar:
-            global_step += 1
             ids, labels  = _unpack_batch(batch, device)
+            n_tokens = int((labels[:, 1:] != -100).sum().item())
+            if n_tokens == 0:
+                writer.add_scalar("data/skipped_zero_label_batches", 1, global_step)
+                continue
+
+            global_step += 1
 
             # Update n_iter every step for smooth curriculum
             cur_n = curriculum_n_iter(global_step, total_steps, args.n_iter) \
@@ -421,7 +426,6 @@ def main():
             loss_val    = out.loss.item()
             epoch_loss += loss_val
             epoch_steps += 1
-            n_tokens = int((labels[:, 1:] != -100).sum().item())
             metrics = model.last_loss_metrics()
             if n_tokens > 0:
                 log_loss_tokens += loss_val * n_tokens
