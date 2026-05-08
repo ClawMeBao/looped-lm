@@ -21,12 +21,12 @@ import argparse, sys, os, math
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, random_split
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
 
 from phase0.src import Phase0Model, Phase0Config
-from common.data_utils import load_text_dataset
+from common.data_utils import load_text_dataset, load_instruction_dataset, load_glm_dataset
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +53,24 @@ def _compute_ppl(logits_list, labels_list) -> float:
     return math.exp(min(total_loss / max(total_tok, 1), 20))
 
 
+def _unpack_batch(batch, device):
+    if isinstance(batch, dict):
+        return batch["input_ids"].to(device), batch["labels"].to(device)
+    ids = batch.to(device)
+    return ids, ids
+
+
+def split_dataset(dataset, ratios=(0.8, 0.1, 0.1), seed=42):
+    n = len(dataset)
+    n_train = int(ratios[0] * n)
+    n_eval = int(ratios[1] * n)
+    n_test = n - n_train - n_eval
+    return random_split(
+        dataset, [n_train, n_eval, n_test],
+        generator=torch.Generator().manual_seed(seed),
+    )
+
+
 @torch.no_grad()
 def eval_looped(model: Phase0Model, loader, device, n_iter: int, desc: str = "") -> float:
     """Eval LoopedLM với n_iter iterations."""
@@ -62,10 +80,10 @@ def eval_looped(model: Phase0Model, loader, device, n_iter: int, desc: str = "")
 
     logits_list, labels_list = [], []
     for batch in tqdm(loader, desc=desc or f"  n_iter={n_iter}", leave=False, ncols=70):
-        ids = batch.to(device)
-        out = model(input_ids=ids, labels=ids)
+        ids, labels = _unpack_batch(batch, device)
+        out = model(input_ids=ids, labels=labels)
         logits_list.append(out.logits.cpu())
-        labels_list.append(ids.cpu())
+        labels_list.append(labels.cpu())
 
     model.cfg.n_iter = orig
     return _compute_ppl(logits_list, labels_list)
@@ -88,10 +106,10 @@ def eval_true_baseline(model_name: str, loader, device, dtype, desc: str = "") -
 
     logits_list, labels_list = [], []
     for batch in tqdm(loader, desc=desc or "  true baseline", leave=False, ncols=70):
-        ids = batch.to(device)
-        out = base(input_ids=ids, labels=ids)
+        ids, labels = _unpack_batch(batch, device)
+        out = base(input_ids=ids, labels=labels)
         logits_list.append(out.logits.cpu())
-        labels_list.append(ids.cpu())
+        labels_list.append(labels.cpu())
 
     del base
     torch.cuda.empty_cache()
@@ -107,13 +125,22 @@ def parse_args():
     p.add_argument("--model",              default="Qwen/Qwen3-1.7B")
     p.add_argument("--checkpoint",         default=None,
                    help="Path to saved connect layer (.pt)")
-    p.add_argument("--connect_type",       default="gated", choices=["mlp", "gated"])
+    p.add_argument("--connect_type",       default="iter_aware", choices=["mlp", "gated", "iter_aware"])
     p.add_argument("--loop_start",         type=int, default=8)
     p.add_argument("--loop_end",           type=int, default=20)
     p.add_argument("--max_iter",           type=int, default=4)
     p.add_argument("--seq_len",            type=int, default=256)
     p.add_argument("--batch_size",         type=int, default=4)
     p.add_argument("--max_samples",        type=int, default=100)
+    p.add_argument("--dataset",            default="Jackrong/GLM-5.1-Reasoning-1M-Cleaned")
+    p.add_argument("--dataset_type",       default="text",
+                   choices=["instruction", "text", "glm"])
+    p.add_argument("--split",              default="validation")
+    p.add_argument("--subset",             default="eval",
+                   choices=["train", "eval", "test"],
+                   help="Internal subset for single-split chat datasets")
+    p.add_argument("--no_think",           action="store_true")
+    p.add_argument("--local_dataset_dir",  default="data/glm_dataset")
     p.add_argument("--true_baseline_only", action="store_true",
                    help="Chỉ đo true baseline, bỏ qua LoopedLM eval")
     p.add_argument("--skip_true_baseline", action="store_true",
@@ -143,11 +170,36 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    dataset = load_text_dataset(
-        tokenizer,
-        max_length  = args.seq_len,
-        max_samples = args.max_samples,
-    )
+    if args.dataset_type == "instruction":
+        full_ds = load_instruction_dataset(
+            tokenizer,
+            dataset_name=args.dataset,
+            split=args.split,
+            max_length=args.seq_len,
+            max_samples=args.max_samples,
+            no_think=args.no_think,
+        )
+        train_ds, eval_ds, test_ds = split_dataset(full_ds)
+        dataset = {"train": train_ds, "eval": eval_ds, "test": test_ds}[args.subset]
+    elif args.dataset_type == "glm":
+        full_ds = load_glm_dataset(
+            tokenizer,
+            dataset_name=args.dataset,
+            split="train",
+            max_length=args.seq_len,
+            max_samples=args.max_samples,
+            no_think=args.no_think,
+            local_dir=args.local_dataset_dir,
+        )
+        train_ds, eval_ds, test_ds = split_dataset(full_ds)
+        dataset = {"train": train_ds, "eval": eval_ds, "test": test_ds}[args.subset]
+    else:
+        dataset = load_text_dataset(
+            tokenizer,
+            split=args.split,
+            max_length=args.seq_len,
+            max_samples=args.max_samples,
+        )
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False)
 
     results = {}
@@ -158,7 +210,7 @@ def main():
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         true_ppl = eval_true_baseline(args.model, loader, device, dtype)
         results["true_baseline"] = true_ppl
-        print(f"    PPL = {true_ppl:.2f}  ← expected ~8–15 for Qwen3-1.7B on WikiText-2")
+        print(f"    PPL = {true_ppl:.2f}")
 
     if args.true_baseline_only:
         print("\n" + "=" * 65)

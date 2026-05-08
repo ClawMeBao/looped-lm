@@ -181,9 +181,11 @@ def _build_chat_example(
 
     Returns (input_ids, labels) tensors or None nếu không có assistant token.
     """
+    # Note: enable_thinking=False does NOT suppress <think> tokens in Qwen3 —
+    # the template always injects an empty <think>\n\n</think> wrapper regardless.
+    # Actual no_think handling is done via _strip_think_tags (content level) +
+    # skip_think_wrapper=True in _find_assistant_spans (label mask level).
     template_kwargs: dict = {}
-    if no_think:
-        template_kwargs["enable_thinking"] = False
 
     # Normalise messages: strip unknown fields, inject reasoning or strip think
     clean_msgs = []

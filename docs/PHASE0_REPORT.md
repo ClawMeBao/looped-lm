@@ -78,6 +78,30 @@ Six bugs were identified and fixed across development iterations:
   `model.state_dict()`, and `model.parameters()` silently skipped them.
 - **Fix:** Wrap all backbone segments in `nn.ModuleList` before assigning as attributes.
 
+### Bug 7 — `aux_loss_weight` computed from pre-suffix hidden states (2026-04-28)
+- **Root cause:** Auxiliary LM loss inside the loop called `lm_head(norm(h_out))` where
+  `h_out` is the loop block output (L19). But `lm_head` was pretrained to decode L27 output
+  (after suffix L20–27). Feeding L19 into `lm_head` puts it in completely the wrong
+  representation space → CE loss unbounded, can reach 50–500+ → gradient direction meaningless
+  → training divergence. With `n_iter=4` this injects 4 bad gradient sources per step.
+- **Symptom:** `train/loss` oscillates 0–600+, PPL capped at 5e8 in TensorBoard.
+- **Fix:** Default `aux_loss_weight` changed to `0.0` in `train.py`. Correct implementation
+  requires passing `h_out` through suffix under `torch.no_grad()` before computing aux CE.
+
+### Bug 8 — `consistency_weight` default mismatch + raw L2 outlier spikes (2026-04-28)
+- **Root cause 1:** `Phase0Config` default = `0.0` but `train.py` argparse default = `0.05`,
+  so consistency loss was silently active in every run without explicit `--consistency_weight`.
+- **Root cause 2:** Consistency loss computed as raw L2 `||h_out_1 - h_out_0||²` on unhidden
+  states. Qwen3 transformer hidden states have extreme outlier features (certain dimensions
+  ~100–1000× larger than average). Raw L2 → consistency term spikes to 20,000+ on affected
+  batches → bimodal loss distribution (<50 normal batches, >900 spike batches) → training
+  unstable despite converging loss trend.
+- **Symptom:** `train/loss_step` chart shows regular spike pulses; loss oscillates between
+  ~<50 and >900 even after fixing Bug 7.
+- **Fix:** Changed consistency loss from raw L2 to **cosine similarity** (bounded [0, 2],
+  immune to outlier scale). Fixed `train.py` default to `0.0` matching `Phase0Config`.
+  `h_prev` chain also now detached for non-final iterations to enforce `k_bptt` depth.
+
 ---
 
 ## 4. Step 1 — Smoke Test

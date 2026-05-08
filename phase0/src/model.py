@@ -48,7 +48,7 @@ class Phase0Config:
     bottleneck_ratio:     float          = 0.25
     k_bptt:               Optional[int]  = 2         # None = full unroll
     # Auxiliary multi-step loss (from Ouro paper Section 3.1)
-    aux_loss_weight:      float          = 0.3   # weight of summed per-iter losses
+    aux_loss_weight:      float          = 0.0   # weight of summed per-iter losses
     aux_loss_gamma:       float          = 0.5   # geometric decay: earlier iters weighted less
     # Optional convergence regularizer
     consistency_weight:   float          = 0.0   # L2 ||h_out_i - h_out_{i-1}||² / d
@@ -68,8 +68,8 @@ class Phase0Model(nn.Module):
     """
     Phase 0: Frozen backbone + trainable connect layer.
 
-    n_iter=0  → true baseline: run all 28 layers normally, no connect.
-    n_iter>=1 → looped: prefix → (loop block → connect) × n_iter → suffix.
+    n_iter=0/1 → true baseline: run all layers once, no connect.
+    n_iter>=2   → prefix → loop → (connect → loop) × (n_iter-1) → suffix.
 
     Trainable params: connect layer only (~2M MLP / ~6M Gated).
     """
@@ -97,6 +97,7 @@ class Phase0Model(nn.Module):
         self._d_model                 = bb.d_model
         self._rotary_uses_position_ids = bb.rotary_uses_position_ids
         self._backbone_config         = bb.config
+        self._last_loss_metrics: dict[str, float] = {}
 
         # Connect layer (ONLY trainable component)
         if cfg.connect_type == "iter_aware":
@@ -170,7 +171,7 @@ class Phase0Model(nn.Module):
         # n_iter=0: TRUE BASELINE — run all 28 layers, identical to HF model.
         # Previous code skipped the loop block entirely, producing PPL ~10k
         # on a mutilated 16-layer forward pass.
-        if self.cfg.n_iter == 0:
+        if self.cfg.n_iter <= 1:
             with torch.no_grad():
                 h = self._run_layers(h, self.prefix_layers,
                                      pos_emb, causal_mask, position_ids, cache_position)
@@ -187,6 +188,7 @@ class Phase0Model(nn.Module):
                     logits[..., :-1, :].contiguous().view(-1, logits.size(-1)),
                     labels[..., 1:].contiguous().view(-1),
                 )
+                self._last_loss_metrics = {"lm_loss": float(loss.detach().item())}
             return CausalLMOutputWithPast(loss=loss, logits=logits)
         # ─────────────────────────────────────────────────────────────────
 
@@ -195,7 +197,9 @@ class Phase0Model(nn.Module):
             h = self._run_layers(h, self.prefix_layers,
                                  pos_emb, causal_mask, position_ids, cache_position)
 
-        # 5. Loop block × n_iter + connect layer (connect is trainable)
+        # 5. Loop block × n_iter. Connect maps loop output back to loop input
+        # only between iterations. The final loop output is already in suffix
+        # input space, so do not connect after the last iteration.
         h_prev = h
         aux_losses: list[torch.Tensor] = []   # per-iteration LM losses for auxiliary signal
         h_out_prev: Optional[torch.Tensor] = None
@@ -215,10 +219,13 @@ class Phase0Model(nn.Module):
             h_out = self._run_layers(h, self.loop_layers,
                                      pos_emb, causal_mask, position_ids, cache_position)
 
-            # Auxiliary LM loss at each iteration (from Ouro paper Section 3.1)
-            # lm_head + norm are frozen but activations flow grad back to connect
+            # Auxiliary LM loss at each iteration. h_out is layer loop_end-1
+            # hidden state, so it must pass through the frozen suffix before
+            # lm_head sees it.
             if labels is not None and self.cfg.aux_loss_weight > 0.0:
-                h_norm_i = self.norm(h_out)
+                h_aux = self._run_layers(h_out, self.suffix_layers,
+                                         pos_emb, causal_mask, position_ids, cache_position)
+                h_norm_i = self.norm(h_aux)
                 logits_i = self.lm_head(h_norm_i)
                 loss_i = nn.CrossEntropyLoss(ignore_index=-100)(
                     logits_i[..., :-1, :].contiguous().view(-1, logits_i.size(-1)),
@@ -226,22 +233,33 @@ class Phase0Model(nn.Module):
                 )
                 aux_losses.append(loss_i)
 
-            # Consistency loss: encourage hidden states to converge across iters
+            # Consistency loss: encourage hidden states to converge across iters.
+            # Uses cosine similarity (bounded [0,2]) instead of raw L2 to avoid
+            # exploding loss from outlier features in large transformer hidden states
+            # (Qwen3 has extreme outlier dims; raw L2 can reach 20000+ → spikes).
             if labels is not None and self.cfg.consistency_weight > 0.0:
                 if h_out_prev is not None:
-                    diff = (h_out - h_out_prev.detach()).pow(2).mean()
+                    h_flat     = h_out.view(-1, h_out.size(-1))
+                    h_prev_flat = h_out_prev.detach().view(-1, h_out_prev.size(-1))
+                    diff = 1.0 - torch.nn.functional.cosine_similarity(
+                        h_flat, h_prev_flat, dim=-1
+                    ).mean()
                     consistency_losses.append(diff)
                 h_out_prev = h_out
 
-            # Connect layer (trainable)
-            if isinstance(self.connect, IterationAwareConnectLayer):
-                h = self.connect(h_out, h_prev, step_idx=i)
-            elif isinstance(self.connect, GatedResidualConnectLayer):
-                h = self.connect(h_out, h_prev)
+            if i == self.cfg.n_iter - 1:
+                h = h_out
             else:
-                h = self.connect(h_out)
+                # Connect layer (trainable): layer loop_end -> layer loop_start
+                if isinstance(self.connect, IterationAwareConnectLayer):
+                    h = self.connect(h_out, h_prev, step_idx=i)
+                elif isinstance(self.connect, GatedResidualConnectLayer):
+                    h = self.connect(h_out, h_prev)
+                else:
+                    h = self.connect(h_out)
 
-            h_prev = h
+                # Bound BPTT depth on the recurrent h_prev chain.
+                h_prev = h.detach()
 
         # 6. Suffix: no torch.no_grad() — gradient must reach connect layer
         h = self._run_layers(h, self.suffix_layers,
@@ -254,10 +272,13 @@ class Phase0Model(nn.Module):
         # 8. Loss
         loss = None
         if labels is not None:
-            loss = nn.CrossEntropyLoss(ignore_index=-100)(
+            lm_loss = nn.CrossEntropyLoss(ignore_index=-100)(
                 logits[..., :-1, :].contiguous().view(-1, logits.size(-1)),
                 labels[..., 1:].contiguous().view(-1),
             )
+            loss = lm_loss
+            aux_total = None
+            consistency_total = None
 
             # Auxiliary multi-step loss: geometric weighting, earlier iters less weight
             # L_total = L_final + aux_weight * sum_i( gamma^(n-1-i) * L_i )
@@ -271,9 +292,22 @@ class Phase0Model(nn.Module):
 
             # Consistency loss
             if consistency_losses and self.cfg.consistency_weight > 0.0:
-                loss = loss + self.cfg.consistency_weight * sum(consistency_losses)
+                consistency_total = sum(consistency_losses)
+                loss = loss + self.cfg.consistency_weight * consistency_total
+
+            self._last_loss_metrics = {
+                "lm_loss": float(lm_loss.detach().item()),
+                "total_loss": float(loss.detach().item()),
+            }
+            if aux_total is not None:
+                self._last_loss_metrics["aux_loss"] = float(aux_total.detach().item())
+            if consistency_total is not None:
+                self._last_loss_metrics["consistency_loss"] = float(consistency_total.detach().item())
 
         return CausalLMOutputWithPast(loss=loss, logits=logits)
+
+    def last_loss_metrics(self) -> dict[str, float]:
+        return dict(self._last_loss_metrics)
 
     # -----------------------------------------------------------------------
     # Utilities
@@ -324,7 +358,7 @@ class Phase0Model(nn.Module):
         print(f"  n_iter          : {self.cfg.n_iter}")
         print(f"  aux_loss_weight : {self.cfg.aux_loss_weight}  (gamma={self.cfg.aux_loss_gamma})")
         print(f"  consistency_w   : {self.cfg.consistency_weight}")
-        print(f"  n_iter=0        : runs all {len(self.prefix_layers)+len(self.loop_layers)+len(self.suffix_layers)} layers (true baseline)")
+        print(f"  n_iter=0/1      : runs all {len(self.prefix_layers)+len(self.loop_layers)+len(self.suffix_layers)} layers once (true baseline)")
 
     # -----------------------------------------------------------------------
     # Factory

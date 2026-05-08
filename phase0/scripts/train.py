@@ -10,7 +10,7 @@ TensorBoard:
     tensorboard --logdir phase0/checkpoints/runs
 """
 
-import argparse, sys, os, math
+import argparse, sys, os, math, json, time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
 # Disable HuggingFace tokenizer parallelism to avoid deadlocks with multi-worker DataLoader
@@ -18,12 +18,24 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 import torch
 from torch.utils.data import DataLoader, random_split
-from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
 
 from phase0.src import Phase0Model, Phase0Config
 from common.data_utils import load_text_dataset, load_instruction_dataset, load_glm_dataset
+
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ModuleNotFoundError:
+    class SummaryWriter:
+        def __init__(self, *args, **kwargs):
+            print("[warn] tensorboard not installed; scalar logging disabled")
+
+        def add_scalar(self, *args, **kwargs):
+            return None
+
+        def close(self):
+            return None
 
 
 def parse_args():
@@ -35,9 +47,15 @@ def parse_args():
     p.add_argument("--n_iter",         type=int,   default=4)
     p.add_argument("--epochs",         type=int,   default=3,
                    help="Number of training epochs")
-    p.add_argument("--eval_every",     type=int,   default=1,
-                   help="Run eval split every N epochs")
-    p.add_argument("--log_steps",      type=int,   default=10,
+    p.add_argument("--max_steps",      type=int,   default=None,
+                   help="Stop after this many optimizer steps (overrides epoch budget)")
+    p.add_argument("--eval_every",     type=int,   default=0,
+                   help="Run eval split every N epochs (0=disabled; prefer --eval_steps)")
+    p.add_argument("--eval_steps",     type=int,   default=250,
+                   help="Run eval split every N optimizer steps (0=disabled)")
+    p.add_argument("--no_eval_all_iters", action="store_true",
+                   help="Only eval target n_iter instead of n_iter=0..N")
+    p.add_argument("--log_steps",      type=int,   default=20,
                    help="Log to TensorBoard every N global steps")
     p.add_argument("--save_every",     type=int,   default=100,
                    help="Save a step checkpoint every N global steps (0=disabled)")
@@ -50,14 +68,14 @@ def parse_args():
                    help="Fraction of total steps for LR warmup")
     p.add_argument("--grad_clip",      type=float, default=1.0)
     p.add_argument("--k_bptt",         type=int,   default=2)
-    p.add_argument("--aux_loss_weight",  type=float, default=0.3,
+    p.add_argument("--aux_loss_weight",  type=float, default=0.0,
                    help="Weight of summed per-iteration auxiliary LM losses (0=disabled)")
     p.add_argument("--aux_loss_gamma",   type=float, default=0.5,
                    help="Geometric decay for earlier iterations in auxiliary loss")
-    p.add_argument("--consistency_weight", type=float, default=0.05,
-                   help="L2 convergence regularizer between loop iterations (0=disabled)")
+    p.add_argument("--consistency_weight", type=float, default=0.0,
+                   help="Cosine-similarity convergence regularizer between loop iterations (0=disabled)")
     p.add_argument("--curriculum",     action="store_true",
-                   help="Ramp n_iter from 1 -> n_iter across epochs")
+                   help="Ramp n_iter from 2 -> n_iter across steps")
     p.add_argument("--max_samples",    type=int,   default=None,
                    help="Limit total loaded samples (default: full dataset). "
                         "Recommended for GLM 1M-row dataset.")
@@ -73,8 +91,8 @@ def parse_args():
                    help="'instruction': Roman claude; 'glm': GLM reasoning; 'text': plain blocks")
     p.add_argument("--no_think",       action="store_true",
                    help="Strip <think> reasoning -- train on answer-only")
-    p.add_argument("--num_workers",    type=int,   default=16,
-                   help="DataLoader worker processes (default: 16)")
+    p.add_argument("--num_workers",    type=int,   default=12,
+                   help="DataLoader worker processes (default: 12)")
     p.add_argument("--local_dataset_dir", default="data/glm_dataset",
                    help="Local dir to cache GLM dataset (Arrow format). "
                         "Auto-download if not found, then save for reuse.")
@@ -83,19 +101,21 @@ def parse_args():
 
 def curriculum_n_iter(global_step: int, total_steps: int, max_n: int) -> int:
     """
-    Step-based curriculum: ramp n_iter mượt từ 1 → max_n theo global step.
+    Step-based curriculum: ramp n_iter mượt từ 2 → max_n theo global step.
 
     Mịn hơn per-epoch khi số epoch nhỏ — không bao giờ skip n_iter value.
     Ví dụ (max_n=4, total_steps=100):
-      step   0 →  24 : n=1
-      step  25 →  49 : n=2
-      step  50 →  74 : n=3
-      step  75 → 100 : n=4
+      step   0 →  33 : n=2
+      step  34 →  66 : n=3
+      step  67 → 100 : n=4
     """
+    if max_n <= 1:
+        return 1
     if total_steps <= 1:
         return max_n
-    n = 1 + int(global_step / total_steps * max_n)
-    return min(max_n, max(1, n))
+    span = max_n - 1
+    n = 2 + int(global_step / total_steps * span)
+    return min(max_n, max(2, n))
 
 
 def _unpack_batch(batch, device):
@@ -118,10 +138,66 @@ def split_dataset(dataset, ratios=(0.8, 0.1, 0.1), seed=42):
     )
 
 
+def save_checkpoint_meta(path: str, cfg: Phase0Config, args, **extra) -> None:
+    meta_path = path + ".meta.json"
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "cfg": cfg.__dict__,
+                "args": vars(args),
+                **extra,
+            },
+            f,
+            indent=2,
+            sort_keys=True,
+        )
+
+
+def dataset_diagnostics(dataset, name: str, max_items: int = 256) -> None:
+    """Print cheap label/truncation diagnostics for tokenized datasets."""
+    n = min(len(dataset), max_items)
+    if n == 0:
+        print(f"[data:{name}] empty dataset")
+        return
+
+    zero_grad = 0
+    assistant_tokens = 0
+    total_tokens = 0
+    likely_truncated = 0
+
+    for i in range(n):
+        item = dataset[i]
+        if not isinstance(item, dict):
+            continue
+        labels = item["labels"]
+        input_ids = item["input_ids"]
+        valid = labels != -100
+        valid_count = int(valid.sum().item())
+        zero_grad += int(valid_count == 0)
+        assistant_tokens += valid_count
+        total_tokens += int(labels.numel())
+        if input_ids.numel() > 0 and labels[-1].item() != -100:
+            likely_truncated += 1
+
+    if total_tokens == 0:
+        return
+    print(
+        f"[data:{name}] checked={n}  "
+        f"assistant_token_ratio={assistant_tokens/total_tokens:.3f}  "
+        f"zero_grad={zero_grad/n:.3f}  "
+        f"likely_truncated={likely_truncated/n:.3f}"
+    )
+
+
 @torch.no_grad()
-def eval_ppl(model, loader, device, n_iter, desc="Eval") -> float:
+def eval_ppl(model, loader, device, n_iter, desc="Eval") -> tuple[float, float]:
+    """Returns (avg_loss, ppl)."""
     orig = model.cfg.n_iter
+    orig_aux = model.cfg.aux_loss_weight
+    orig_consistency = model.cfg.consistency_weight
     model.cfg.n_iter = n_iter
+    model.cfg.aux_loss_weight = 0.0
+    model.cfg.consistency_weight = 0.0
     model.eval()
     total_loss, total_tok = 0.0, 0
     for batch in tqdm(loader, desc=desc, leave=False, unit="batch"):
@@ -133,9 +209,44 @@ def eval_ppl(model, loader, device, n_iter, desc="Eval") -> float:
         total_loss += out.loss.item() * n
         total_tok  += n
     model.cfg.n_iter = orig
+    model.cfg.aux_loss_weight = orig_aux
+    model.cfg.consistency_weight = orig_consistency
     if total_tok == 0:
-        return float("inf")
-    return math.exp(min(total_loss / total_tok, 20))
+        return float("inf"), float("inf")
+    avg_loss = total_loss / total_tok
+    return avg_loss, math.exp(min(avg_loss, 20))
+
+
+def eval_suite(model, loader, device, args, baseline_ppl, writer, global_step: int) -> tuple[float, float]:
+    """Eval target n_iter, optionally all depths, and log by global step."""
+    if args.no_eval_all_iters:
+        eval_iters = [args.n_iter]
+    else:
+        eval_iters = list(range(0, args.n_iter + 1))
+
+    target_loss, target_ppl = float("inf"), float("inf")
+    best_iter, best_ppl = None, float("inf")
+
+    for n_iter in eval_iters:
+        loss, ppl = eval_ppl(model, loader, device, n_iter=n_iter,
+                             desc=f"Eval n={n_iter} [step {global_step}]")
+        writer.add_scalar(f"eval/loss_n{n_iter}", loss, global_step)
+        writer.add_scalar(f"eval/ppl_n{n_iter}", ppl, global_step)
+        writer.add_scalar(f"eval/delta_vs_baseline_n{n_iter}",
+                          ppl - baseline_ppl, global_step)
+        if n_iter == args.n_iter:
+            target_loss, target_ppl = loss, ppl
+            writer.add_scalar("eval/loss", loss, global_step)
+            writer.add_scalar("eval/ppl", ppl, global_step)
+            writer.add_scalar("eval/delta_vs_baseline", ppl - baseline_ppl, global_step)
+        if ppl < best_ppl:
+            best_iter, best_ppl = n_iter, ppl
+
+    if best_iter is not None:
+        writer.add_scalar("eval/best_n_iter", best_iter, global_step)
+        writer.add_scalar("eval/best_ppl", best_ppl, global_step)
+
+    return target_loss, target_ppl
 
 
 def main():
@@ -161,6 +272,8 @@ def main():
         aux_loss_gamma     = args.aux_loss_gamma,
         consistency_weight = args.consistency_weight,
     )
+    if args.n_iter < 2:
+        raise ValueError("Training connect layer requires --n_iter >= 2; n_iter=1 is baseline pass-through.")
     model  = Phase0Model.from_pretrained(cfg, torch_dtype=dtype)
     device = next(model.connect.parameters()).device
     model.print_summary()
@@ -202,6 +315,8 @@ def main():
     train_ds, eval_ds, test_ds = split_dataset(full_ds)
     print(f"\n[data] Split -> train: {len(train_ds)}  "
           f"eval: {len(eval_ds)}  test: {len(test_ds)}\n")
+    dataset_diagnostics(train_ds, "train")
+    dataset_diagnostics(eval_ds, "eval")
 
     train_dl = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True, drop_last=True,
@@ -220,7 +335,7 @@ def main():
     )
 
     steps_per_epoch = len(train_dl)
-    total_steps     = args.epochs * steps_per_epoch
+    total_steps     = args.max_steps or (args.epochs * steps_per_epoch)
     warmup_steps    = max(1, int(total_steps * args.warmup_ratio))
 
     optimizer = torch.optim.AdamW(
@@ -228,19 +343,21 @@ def main():
     )
     scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
 
-    print(f"Epochs: {args.epochs}  |  Steps/epoch: {steps_per_epoch}"
+    max_epochs = math.ceil(total_steps / steps_per_epoch)
+    print(f"Epochs: {max_epochs}  |  Steps/epoch: {steps_per_epoch}"
           f"  |  Total: {total_steps}  |  Warmup: {warmup_steps}")
     print(f"TensorBoard: tensorboard --logdir {log_dir}\n")
 
     # -- Baseline ----------------------------------------------------------
-    baseline_ppl = eval_ppl(model, eval_dl, device, n_iter=0, desc="Baseline")
-    print(f"Baseline PPL (n_iter=0, all layers): {baseline_ppl:.2f}")
+    baseline_loss, baseline_ppl = eval_ppl(model, eval_dl, device, n_iter=0, desc="Baseline")
+    print(f"Baseline PPL (n_iter=0, all layers): {baseline_ppl:.2f}  loss={baseline_loss:.4f}")
     if args.dataset_type != "text":
         mode = "no-think" if args.no_think else "thinking"
         print(f"  (instruction [{mode}] -- chat-format PPL)\n")
     else:
         print()
     writer.add_scalar("ppl/baseline", baseline_ppl, 0)
+    writer.add_scalar("eval/ppl_n0", baseline_ppl, 0)
 
     best_ppl       = float("inf")
     global_step    = 0
@@ -259,18 +376,22 @@ def main():
               f"(step={global_step}, epoch={start_epoch}, best_ppl={best_ppl:.2f})")
 
     # -- Training loop -----------------------------------------------------
-    for epoch in range(start_epoch, args.epochs + 1):
+    for epoch in range(start_epoch, max_epochs + 1):
         model.train()
         model.connect.train()
 
         epoch_loss = 0.0
-        log_loss   = 0.0
-        log_cnt    = 0
+        epoch_steps = 0
+        log_loss_tokens = 0.0
+        log_lm_loss_tokens = 0.0
+        log_tokens = 0
+        log_cnt = 0
+        log_start = time.perf_counter()
 
         # cur_n shown in tqdm postfix; compute start value just for clarity
         pbar = tqdm(
             train_dl,
-            desc=f"Epoch {epoch}/{args.epochs}",
+            desc=f"Epoch {epoch}/{max_epochs}",
             unit="batch", dynamic_ncols=True,
         )
         for batch in pbar:
@@ -285,13 +406,19 @@ def main():
             optimizer.zero_grad()
             out = model(input_ids=ids, labels=labels)
             out.loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.trainable_parameters(), args.grad_clip)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.trainable_parameters(), args.grad_clip)
             optimizer.step()
             scheduler.step()
 
             loss_val    = out.loss.item()
             epoch_loss += loss_val
-            log_loss   += loss_val
+            epoch_steps += 1
+            n_tokens = int((labels[:, 1:] != -100).sum().item())
+            metrics = model.last_loss_metrics()
+            if n_tokens > 0:
+                log_loss_tokens += loss_val * n_tokens
+                log_lm_loss_tokens += metrics.get("lm_loss", loss_val) * n_tokens
+                log_tokens += n_tokens
             log_cnt    += 1
 
             pbar.set_postfix(
@@ -302,14 +429,53 @@ def main():
 
             # Per-step loss (always logged for smooth curve)
             writer.add_scalar("train/loss_step", loss_val, global_step)
+            writer.add_scalar("train/lm_loss_step", metrics.get("lm_loss", loss_val), global_step)
+            writer.add_scalar("train/grad_norm", float(grad_norm), global_step)
+            writer.add_scalar("train/tokens", n_tokens, global_step)
+            for name in ("aux_loss", "consistency_loss"):
+                if name in metrics:
+                    writer.add_scalar(f"train/{name}_step", metrics[name], global_step)
 
             if global_step % args.log_steps == 0:
-                avg = log_loss / log_cnt
+                denom = max(log_tokens, 1)
+                avg = log_loss_tokens / denom
+                lm_avg = log_lm_loss_tokens / denom
+                elapsed = max(time.perf_counter() - log_start, 1e-9)
                 writer.add_scalar("train/loss",   avg,                        global_step)
-                writer.add_scalar("train/ppl",    math.exp(min(avg, 20)),     global_step)
+                writer.add_scalar("train/lm_loss", lm_avg,                    global_step)
+                writer.add_scalar("train/ppl",    math.exp(min(lm_avg, 20)),  global_step)
                 writer.add_scalar("train/lr",     scheduler.get_last_lr()[0], global_step)
                 writer.add_scalar("train/n_iter", cur_n,                      global_step)
-                log_loss, log_cnt = 0.0, 0
+                writer.add_scalar("runtime/tokens_per_sec", log_tokens / elapsed, global_step)
+                writer.add_scalar("runtime/steps_per_sec", log_cnt / elapsed, global_step)
+                if torch.cuda.is_available():
+                    writer.add_scalar("runtime/gpu_mem_allocated_gb",
+                                      torch.cuda.max_memory_allocated() / 1e9,
+                                      global_step)
+                    torch.cuda.reset_peak_memory_stats()
+                log_loss_tokens = 0.0
+                log_lm_loss_tokens = 0.0
+                log_tokens = 0
+                log_cnt = 0
+                log_start = time.perf_counter()
+
+            if args.eval_steps > 0 and global_step % args.eval_steps == 0:
+                eval_loss, ppl = eval_suite(model, eval_dl, device, args,
+                                            baseline_ppl, writer, global_step)
+                sign = "+" if ppl - baseline_ppl >= 0 else ""
+                print(f"  [Eval step {global_step}] loss={eval_loss:.4f}  PPL={ppl:.2f}  "
+                      f"({sign}{ppl-baseline_ppl:.2f} vs baseline={baseline_ppl:.2f})")
+
+                if ppl < best_ppl:
+                    best_ppl = ppl
+                    ckpt = os.path.join(args.output_dir, "best_connect.pt")
+                    model.save_connect(ckpt)
+                    save_checkpoint_meta(ckpt, cfg, args, epoch=epoch,
+                                         global_step=global_step, eval_ppl=ppl)
+                    print(f"  Best saved: {ckpt}")
+
+                model.train()
+                model.connect.train()
 
             if args.save_every > 0 and global_step % args.save_every == 0:
                 resume_ckpt = os.path.join(args.output_dir, "resume.pt")
@@ -322,6 +488,7 @@ def main():
                         "global_step": global_step,
                         "epoch":       epoch,
                         "best_ppl":    best_ppl,
+                        "cfg":         cfg.__dict__,
                         "args":        vars(args),
                     },
                     tmp_ckpt,
@@ -329,48 +496,59 @@ def main():
                 os.replace(tmp_ckpt, resume_ckpt)  # atomic overwrite
                 print(f"  [ckpt] Resume checkpoint → {resume_ckpt}  (step {global_step})")
 
+            if args.max_steps is not None and global_step >= args.max_steps:
+                break
+
         pbar.close()
 
-        avg_epoch = epoch_loss / steps_per_epoch
+        avg_epoch = epoch_loss / max(epoch_steps, 1)
         writer.add_scalar("epoch/train_loss", avg_epoch, epoch)
         writer.add_scalar("epoch/train_ppl",  math.exp(min(avg_epoch, 20)), epoch)
-        print(f"\n  Epoch {epoch}/{args.epochs} -- "
+        print(f"\n  Epoch {epoch}/{max_epochs} -- "
               f"avg loss: {avg_epoch:.4f}  "
               f"(train PPL~{math.exp(min(avg_epoch,20)):.2f})")
 
         # -- Eval on eval split --------------------------------------------
-        if epoch % args.eval_every == 0:
-            ppl  = eval_ppl(model, eval_dl, device, n_iter=args.n_iter,
-                            desc=f"Eval [epoch {epoch}]")
+        if args.eval_every > 0 and epoch % args.eval_every == 0:
+            eval_loss, ppl = eval_suite(model, eval_dl, device, args,
+                                        baseline_ppl, writer, global_step)
             sign = "+" if ppl - baseline_ppl >= 0 else ""
-            print(f"  [Eval]  PPL={ppl:.2f}  "
+            print(f"  [Eval]  loss={eval_loss:.4f}  PPL={ppl:.2f}  "
                   f"({sign}{ppl-baseline_ppl:.2f} vs baseline={baseline_ppl:.2f})")
-            writer.add_scalar("eval/ppl", ppl, epoch)
 
             if ppl < best_ppl:
                 best_ppl = ppl
                 ckpt = os.path.join(args.output_dir, "best_connect.pt")
                 model.save_connect(ckpt)
+                save_checkpoint_meta(ckpt, cfg, args, epoch=epoch,
+                                     global_step=global_step, eval_ppl=ppl)
                 print(f"  Best saved: {ckpt}")
 
         model.train()
         model.connect.train()
 
+        if args.max_steps is not None and global_step >= args.max_steps:
+            break
+
     # -- Final validation on held-out test split ---------------------------
     print("\n" + "=" * 60)
-    val_ppl = eval_ppl(model, test_dl, device, n_iter=args.n_iter,
-                       desc="Final Validate")
+    val_loss, val_ppl = eval_ppl(model, test_dl, device, n_iter=args.n_iter,
+                                 desc="Final Validate")
     sign = "+" if val_ppl - baseline_ppl >= 0 else ""
-    print(f"Final Validate PPL: {val_ppl:.2f}  "
+    print(f"Final Validate  loss={val_loss:.4f}  PPL={val_ppl:.2f}  "
           f"({sign}{val_ppl-baseline_ppl:.2f} vs baseline={baseline_ppl:.2f})")
-    writer.add_scalar("validate/ppl", val_ppl, args.epochs)
+    writer.add_scalar("validate/loss", val_loss, global_step)
+    writer.add_scalar("validate/ppl",  val_ppl,  global_step)
+    writer.add_scalar("validate/delta_vs_baseline", val_ppl - baseline_ppl, global_step)
 
     final = os.path.join(args.output_dir, "final_connect.pt")
     model.save_connect(final)
+    save_checkpoint_meta(final, cfg, args, epoch=epoch,
+                         global_step=global_step, validate_ppl=val_ppl)
     writer.close()
 
     print(f"\nDone. Best eval PPL: {best_ppl:.2f}  |  "
-          f"Val PPL: {val_ppl:.2f}  |  Baseline: {baseline_ppl:.2f}")
+          f"Val loss: {val_loss:.4f}  PPL: {val_ppl:.2f}  |  Baseline: {baseline_ppl:.2f}")
 
 
 if __name__ == "__main__":
