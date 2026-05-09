@@ -1,6 +1,6 @@
 """
 Connect Layer — dùng chung cho tất cả phases.
-Implements: MLPConnectLayer (Phương án B) + GatedResidualConnectLayer (Phương án C)
+Implements: conservative residual + MLP + gated + iteration-aware variants.
 
 Mục tiêu: remap hidden state từ loop block output (layer j space)
 về loop block input (layer i space).
@@ -18,6 +18,42 @@ def _build_norm(d_model: int) -> nn.Module:
         return nn.RMSNorm(d_model, eps=1e-6)
     # Fallback cho PyTorch < 2.4
     return nn.LayerNorm(d_model, eps=1e-6, elementwise_affine=True)
+
+
+# ---------------------------------------------------------------------------
+# Phương án A — Conservative Residual
+# ---------------------------------------------------------------------------
+
+class ResidualConnectLayer(nn.Module):
+    """
+    Conservative remap: h_j -> delta, then add a small learned delta to h_prev.
+
+    Warm-start behavior is exactly stable for a looped backbone:
+        output = h_prev
+
+    This keeps the hidden state on the original layer-i manifold at step 0.
+    The trainable path can then learn only the correction needed to reuse the
+    loop block, instead of freely rewriting/renormalizing the whole hidden.
+    """
+
+    def __init__(self, d_model: int = 2048, bottleneck_ratio: float = 0.25):
+        super().__init__()
+        d_inner = max(64, int(d_model * bottleneck_ratio))
+
+        self.pre_norm = _build_norm(d_model)
+        self.down_proj = nn.Linear(d_model, d_inner, bias=False)
+        self.up_proj = nn.Linear(d_inner, d_model, bias=False)
+        self.act = nn.SiLU()
+
+        # Start from no-op. The scalar is also learned, but initialized small.
+        self.residual_scale = nn.Parameter(torch.tensor(0.01))
+
+        nn.init.normal_(self.down_proj.weight, std=0.02)
+        nn.init.zeros_(self.up_proj.weight)
+
+    def forward(self, h_j: torch.Tensor, h_prev: torch.Tensor) -> torch.Tensor:
+        delta = self.up_proj(self.act(self.down_proj(self.pre_norm(h_j))))
+        return h_prev + self.residual_scale.to(dtype=h_prev.dtype) * delta
 
 
 # ---------------------------------------------------------------------------

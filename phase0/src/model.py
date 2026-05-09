@@ -29,7 +29,12 @@ import torch.nn as nn
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from common.backbone import BackboneComponents, load_backbone
-from common.connect_layer import MLPConnectLayer, GatedResidualConnectLayer, IterationAwareConnectLayer
+from common.connect_layer import (
+    ResidualConnectLayer,
+    MLPConnectLayer,
+    GatedResidualConnectLayer,
+    IterationAwareConnectLayer,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -44,7 +49,7 @@ class Phase0Config:
     loop_start:           int            = 8
     loop_end:             int            = 20
     n_iter:               int            = 4
-    connect_type:         str            = "iter_aware"   # "mlp" | "gated" | "iter_aware"
+    connect_type:         str            = "residual"   # "residual" | "mlp" | "gated" | "iter_aware"
     bottleneck_ratio:     float          = 0.25
     k_bptt:               Optional[int]  = 2         # None = full unroll
     # Auxiliary multi-step loss (from Ouro paper Section 3.1)
@@ -98,9 +103,12 @@ class Phase0Model(nn.Module):
         self._rotary_uses_position_ids = bb.rotary_uses_position_ids
         self._backbone_config         = bb.config
         self._last_loss_metrics: dict[str, float] = {}
+        self._last_connect_metrics: dict[str, float] = {}
 
         # Connect layer (ONLY trainable component)
-        if cfg.connect_type == "iter_aware":
+        if cfg.connect_type == "residual":
+            self.connect = ResidualConnectLayer(bb.d_model, cfg.bottleneck_ratio)
+        elif cfg.connect_type == "iter_aware":
             self.connect = IterationAwareConnectLayer(bb.d_model, cfg.bottleneck_ratio)
         elif cfg.connect_type == "gated":
             self.connect = GatedResidualConnectLayer(bb.d_model, cfg.bottleneck_ratio)
@@ -172,6 +180,7 @@ class Phase0Model(nn.Module):
         # Previous code skipped the loop block entirely, producing PPL ~10k
         # on a mutilated 16-layer forward pass.
         if self.cfg.n_iter <= 1:
+            self._last_connect_metrics = {}
             with torch.no_grad():
                 h = self._run_layers(h, self.prefix_layers,
                                      pos_emb, causal_mask, position_ids, cache_position)
@@ -204,6 +213,8 @@ class Phase0Model(nn.Module):
         aux_losses: list[torch.Tensor] = []   # per-iteration LM losses for auxiliary signal
         h_out_prev: Optional[torch.Tensor] = None
         consistency_losses: list[torch.Tensor] = []
+        connect_update_ratios: list[torch.Tensor] = []
+        connect_cosines: list[torch.Tensor] = []
 
         for i in range(self.cfg.n_iter):
             # Truncated BPTT: detach h entering early iterations so gradient
@@ -252,14 +263,46 @@ class Phase0Model(nn.Module):
             else:
                 # Connect layer (trainable): layer loop_end -> layer loop_start
                 if isinstance(self.connect, IterationAwareConnectLayer):
-                    h = self.connect(h_out, h_prev, step_idx=i)
+                    h_next = self.connect(h_out, h_prev, step_idx=i)
+                elif isinstance(self.connect, ResidualConnectLayer):
+                    h_next = self.connect(h_out, h_prev)
                 elif isinstance(self.connect, GatedResidualConnectLayer):
-                    h = self.connect(h_out, h_prev)
+                    h_next = self.connect(h_out, h_prev)
                 else:
-                    h = self.connect(h_out)
+                    h_next = self.connect(h_out)
+
+                # Cheap diagnostics: if update_norm_ratio is near 0, the
+                # connect layer is effectively a no-op and extra loop compute
+                # may not be buying quality.
+                with torch.no_grad():
+                    update = h_next - h_prev
+                    update_norm = update.float().norm(dim=-1).mean()
+                    prev_norm = h_prev.float().norm(dim=-1).mean().clamp_min(1e-12)
+                    connect_update_ratios.append(update_norm / prev_norm)
+                    connect_cosines.append(
+                        torch.nn.functional.cosine_similarity(
+                            h_next.float().view(-1, h_next.size(-1)),
+                            h_prev.float().view(-1, h_prev.size(-1)),
+                            dim=-1,
+                        ).mean()
+                    )
+
+                h = h_next
 
                 # Bound BPTT depth on the recurrent h_prev chain.
                 h_prev = h.detach()
+
+        if connect_update_ratios:
+            ratios = torch.stack(connect_update_ratios)
+            cosines = torch.stack(connect_cosines)
+            self._last_connect_metrics = {
+                "update_norm_ratio_mean": float(ratios.mean().item()),
+                "update_norm_ratio_max": float(ratios.max().item()),
+                "output_cosine_to_prev_mean": float(cosines.mean().item()),
+                "output_cosine_to_prev_min": float(cosines.min().item()),
+            }
+        else:
+            self._last_connect_metrics = {}
 
         # 6. Suffix: no torch.no_grad() — gradient must reach connect layer
         h = self._run_layers(h, self.suffix_layers,
@@ -308,6 +351,9 @@ class Phase0Model(nn.Module):
 
     def last_loss_metrics(self) -> dict[str, float]:
         return dict(self._last_loss_metrics)
+
+    def last_connect_metrics(self) -> dict[str, float]:
+        return dict(self._last_connect_metrics)
 
     # -----------------------------------------------------------------------
     # Utilities

@@ -3,7 +3,7 @@ phase0/scripts/train.py
 
 Chạy:
     python phase0/scripts/train.py
-    python phase0/scripts/train.py --connect_type gated --epochs 5 --curriculum
+    python phase0/scripts/train.py --connect_type residual --epochs 5 --curriculum
     python phase0/scripts/train.py --dataset_type glm --no_think --epochs 3 --max_samples 10000
 
 TensorBoard:
@@ -41,7 +41,7 @@ except ModuleNotFoundError:
 def parse_args():
     p = argparse.ArgumentParser(description="Phase 0 — Train connect layer")
     p.add_argument("--model",          default="Qwen/Qwen3-1.7B")
-    p.add_argument("--connect_type",   default="iter_aware", choices=["mlp", "gated", "iter_aware"])
+    p.add_argument("--connect_type",   default="residual", choices=["residual", "mlp", "gated", "iter_aware"])
     p.add_argument("--loop_start",     type=int,   default=8)
     p.add_argument("--loop_end",       type=int,   default=20)
     p.add_argument("--n_iter",         type=int,   default=4)
@@ -202,6 +202,8 @@ def eval_ppl(model, loader, device, n_iter, desc="Eval") -> tuple[float, float]:
     model.cfg.consistency_weight = 0.0
     model.eval()
     total_loss, total_tok = 0.0, 0
+    connect_sums: dict[str, float] = {}
+    connect_count = 0
     for batch_idx, batch in enumerate(tqdm(loader, desc=desc, leave=False, unit="batch")):
         if getattr(model, "_eval_max_batches", None) is not None and batch_idx >= model._eval_max_batches:
             break
@@ -212,11 +214,21 @@ def eval_ppl(model, loader, device, n_iter, desc="Eval") -> tuple[float, float]:
             continue
         total_loss += out.loss.item() * n
         total_tok  += n
+        connect_metrics = model.last_connect_metrics()
+        if connect_metrics:
+            for key, value in connect_metrics.items():
+                connect_sums[key] = connect_sums.get(key, 0.0) + float(value)
+            connect_count += 1
     model.cfg.n_iter = orig
     model.cfg.aux_loss_weight = orig_aux
     model.cfg.consistency_weight = orig_consistency
     if total_tok == 0:
+        model._last_eval_connect_metrics = {}
         return float("inf"), float("inf")
+    model._last_eval_connect_metrics = {
+        key: value / max(connect_count, 1)
+        for key, value in connect_sums.items()
+    }
     avg_loss = total_loss / total_tok
     return avg_loss, math.exp(min(avg_loss, 20))
 
@@ -235,15 +247,20 @@ def eval_suite(model, loader, device, args, baseline_ppl, writer, global_step: i
     for n_iter in eval_iters:
         loss, ppl = eval_ppl(model, loader, device, n_iter=n_iter,
                              desc=f"Eval n={n_iter} [step {global_step}]")
+        connect_metrics = getattr(model, "_last_eval_connect_metrics", {})
         writer.add_scalar(f"eval/loss_n{n_iter}", loss, global_step)
         writer.add_scalar(f"eval/ppl_n{n_iter}", ppl, global_step)
         writer.add_scalar(f"eval/delta_vs_baseline_n{n_iter}",
                           ppl - baseline_ppl, global_step)
+        for key, value in connect_metrics.items():
+            writer.add_scalar(f"eval/connect/{key}_n{n_iter}", value, global_step)
         if n_iter == args.n_iter:
             target_loss, target_ppl = loss, ppl
             writer.add_scalar("eval/loss", loss, global_step)
             writer.add_scalar("eval/ppl", ppl, global_step)
             writer.add_scalar("eval/delta_vs_baseline", ppl - baseline_ppl, global_step)
+            for key, value in connect_metrics.items():
+                writer.add_scalar(f"eval/connect/{key}", value, global_step)
         if ppl < best_ppl:
             best_iter, best_ppl = n_iter, ppl
 
@@ -444,6 +461,8 @@ def main():
             writer.add_scalar("train/lm_loss_step", metrics.get("lm_loss", loss_val), global_step)
             writer.add_scalar("train/grad_norm", float(grad_norm), global_step)
             writer.add_scalar("train/tokens", n_tokens, global_step)
+            for key, value in model.last_connect_metrics().items():
+                writer.add_scalar(f"train/connect/{key}_step", value, global_step)
             for name in ("aux_loss", "consistency_loss"):
                 if name in metrics:
                     writer.add_scalar(f"train/{name}_step", metrics[name], global_step)

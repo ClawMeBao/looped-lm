@@ -72,21 +72,70 @@ def split_dataset(dataset, ratios=(0.8, 0.1, 0.1), seed=42):
 
 
 @torch.no_grad()
-def eval_looped(model: Phase0Model, loader, device, n_iter: int, desc: str = "") -> float:
-    """Eval LoopedLM với n_iter iterations."""
+def eval_looped_details(model: Phase0Model, loader, device, n_iter: int, desc: str = "") -> dict:
+    """Eval LoopedLM với n_iter iterations; returns PPL + connect diagnostics."""
     orig = model.cfg.n_iter
     model.cfg.n_iter = n_iter
     model.eval()
 
     logits_list, labels_list = [], []
+    connect_sums: dict[str, float] = {}
+    connect_count = 0
     for batch in tqdm(loader, desc=desc or f"  n_iter={n_iter}", leave=False, ncols=70):
         ids, labels = _unpack_batch(batch, device)
         out = model(input_ids=ids, labels=labels)
         logits_list.append(out.logits.cpu())
         labels_list.append(labels.cpu())
+        connect_metrics = model.last_connect_metrics()
+        if connect_metrics:
+            for key, value in connect_metrics.items():
+                connect_sums[key] = connect_sums.get(key, 0.0) + float(value)
+            connect_count += 1
 
     model.cfg.n_iter = orig
-    return _compute_ppl(logits_list, labels_list)
+    metrics = {
+        key: value / max(connect_count, 1)
+        for key, value in connect_sums.items()
+    }
+    metrics["ppl"] = _compute_ppl(logits_list, labels_list)
+    return metrics
+
+
+@torch.no_grad()
+def eval_looped(model: Phase0Model, loader, device, n_iter: int, desc: str = "") -> float:
+    return eval_looped_details(model, loader, device, n_iter, desc)["ppl"]
+
+
+@torch.no_grad()
+def eval_logit_kl_vs_n0(model: Phase0Model, loader, device, n_iter: int) -> float:
+    """
+    Streaming KL(logits_n0 || logits_n). Optional: expensive but useful to see
+    whether extra loop iterations materially change the distribution.
+    """
+    orig = model.cfg.n_iter
+    model.eval()
+    total_kl, total_tok = 0.0, 0
+    for batch in tqdm(loader, desc=f"  KL n0→n{n_iter}", leave=False, ncols=70):
+        ids, labels = _unpack_batch(batch, device)
+        valid = labels[:, 1:] != -100
+        n_tok = int(valid.sum().item())
+        if n_tok == 0:
+            continue
+
+        model.cfg.n_iter = 0
+        logits0 = model(input_ids=ids).logits[:, :-1, :].float()
+        model.cfg.n_iter = n_iter
+        logitsn = model(input_ids=ids).logits[:, :-1, :].float()
+
+        logp0 = torch.log_softmax(logits0, dim=-1)
+        logpn = torch.log_softmax(logitsn, dim=-1)
+        p0 = logp0.exp()
+        kl_tok = (p0 * (logp0 - logpn)).sum(dim=-1)
+        total_kl += kl_tok[valid].sum().item()
+        total_tok += n_tok
+
+    model.cfg.n_iter = orig
+    return total_kl / max(total_tok, 1)
 
 
 @torch.no_grad()
@@ -125,7 +174,7 @@ def parse_args():
     p.add_argument("--model",              default="Qwen/Qwen3-1.7B")
     p.add_argument("--checkpoint",         default=None,
                    help="Path to saved connect layer (.pt)")
-    p.add_argument("--connect_type",       default="iter_aware", choices=["mlp", "gated", "iter_aware"])
+    p.add_argument("--connect_type",       default="residual", choices=["residual", "mlp", "gated", "iter_aware"])
     p.add_argument("--loop_start",         type=int, default=8)
     p.add_argument("--loop_end",           type=int, default=20)
     p.add_argument("--max_iter",           type=int, default=4)
@@ -145,6 +194,8 @@ def parse_args():
                    help="Chỉ đo true baseline, bỏ qua LoopedLM eval")
     p.add_argument("--skip_true_baseline", action="store_true",
                    help="Bỏ qua true baseline eval (nếu đã biết rồi)")
+    p.add_argument("--logit_kl",           action="store_true",
+                   help="Also compute KL(logits_n0 || logits_n) for n>=2. Costs extra VRAM/time.")
     p.add_argument("--dtype",              default="bfloat16",
                    choices=["float32", "bfloat16", "float16"])
     return p.parse_args()
@@ -243,10 +294,24 @@ def main():
 
     # ── 3. LoopedLM n_iter=1..max_iter ───────────────────────────────
     print(f"\n[3] LoopedLM n_iter=1..{args.max_iter} (connect layer)")
+    connect_results = {}
+    kl_results = {}
     for n in range(1, args.max_iter + 1):
-        ppl = eval_looped(model, loader, device, n_iter=n)
+        details = eval_looped_details(model, loader, device, n_iter=n)
+        ppl = details["ppl"]
         results[f"looped_n{n}"] = ppl
-        print(f"    n_iter={n}  PPL={ppl:.2f}")
+        connect_results[n] = details
+        extra = ""
+        if "update_norm_ratio_mean" in details:
+            extra = (
+                f"  update_ratio={details['update_norm_ratio_mean']:.5f}"
+                f"  cosine={details['output_cosine_to_prev_mean']:.5f}"
+            )
+        if args.logit_kl and n >= 2:
+            kl = eval_logit_kl_vs_n0(model, loader, device, n_iter=n)
+            kl_results[n] = kl
+            extra += f"  KL(n0||n{n})={kl:.5f}"
+        print(f"    n_iter={n}  PPL={ppl:.2f}{extra}")
 
     # ── Summary ──────────────────────────────────────────────────────
     print("\n" + "─" * 65)
@@ -266,8 +331,17 @@ def main():
         ppl   = results[f"looped_n{n}"]
         delta = ppl - ref_ppl
         better = "✅" if ppl < ref_ppl else "  "
+        details = connect_results.get(n, {})
+        extra = ""
+        if "update_norm_ratio_mean" in details:
+            extra = (
+                f"  update={details['update_norm_ratio_mean']:.5f}"
+                f"  cos={details['output_cosine_to_prev_mean']:.5f}"
+            )
+        if n in kl_results:
+            extra += f"  KL={kl_results[n]:.5f}"
         print(f"  {better} LoopedLM n_iter={n}         : PPL = {ppl:.2f}  "
-              f"(Δ={delta:+.2f} vs {ref_label})")
+              f"(Δ={delta:+.2f} vs {ref_label}){extra}")
 
     best_n = min(
         (n for n in range(1, args.max_iter + 1)),

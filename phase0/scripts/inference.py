@@ -21,7 +21,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="Phase 0 — Inference")
     p.add_argument("--model",          default="Qwen/Qwen3-1.7B")
     p.add_argument("--checkpoint",     default=None)
-    p.add_argument("--connect_type",   default="iter_aware", choices=["mlp", "gated", "iter_aware"])
+    p.add_argument("--connect_type",   default="residual", choices=["residual", "mlp", "gated", "iter_aware"])
     p.add_argument("--loop_start",     type=int,   default=8)
     p.add_argument("--loop_end",       type=int,   default=20)
     p.add_argument("--n_iter",         type=int,   default=4)
@@ -52,6 +52,44 @@ def build_prompt(tokenizer, user_text: str, system: str | None, no_think: bool) 
         messages,
         tokenize=False,
         add_generation_prompt=True,
+    )
+
+
+def repetition_stats(text: str) -> dict[str, float]:
+    tokens = text.split()
+    chars = [ch for ch in text if not ch.isspace()]
+    if not tokens and not chars:
+        return {
+            "tokens": 0,
+            "distinct_ratio": 0.0,
+            "repeat_bigram_ratio": 0.0,
+            "char_distinct_ratio": 0.0,
+            "repeat_trigram_ratio": 0.0,
+        }
+
+    bigrams = list(zip(tokens, tokens[1:]))
+    repeated_bigrams = len(bigrams) - len(set(bigrams)) if bigrams else 0
+    trigrams = list(zip(chars, chars[1:], chars[2:]))
+    repeated_trigrams = len(trigrams) - len(set(trigrams)) if trigrams else 0
+    return {
+        "tokens": float(len(tokens)),
+        "distinct_ratio": len(set(tokens)) / max(1, len(tokens)),
+        "repeat_bigram_ratio": repeated_bigrams / max(1, len(bigrams)),
+        "char_distinct_ratio": len(set(chars)) / max(1, len(chars)),
+        "repeat_trigram_ratio": repeated_trigrams / max(1, len(trigrams)),
+    }
+
+
+def print_output(text: str) -> None:
+    print(text)
+    stats = repetition_stats(text)
+    print(
+        "\n[gen] "
+        f"tokens={int(stats['tokens'])}  "
+        f"distinct={stats['distinct_ratio']:.3f}  "
+        f"repeat_bigram={stats['repeat_bigram_ratio']:.3f}  "
+        f"char_distinct={stats['char_distinct_ratio']:.3f}  "
+        f"repeat_trigram={stats['repeat_trigram_ratio']:.3f}"
     )
 
 
@@ -150,14 +188,14 @@ def main():
     if args.compare:
         print("── BASELINE (n_iter=0) " + "─" * 38)
         out_base = generate(model, tokenizer, prompt_text, n_iter=0, **kwargs)
-        print(out_base)
+        print_output(out_base)
         print(f"\n── LOOPED (n_iter={args.n_iter}) " + "─" * 38)
         out_loop = generate(model, tokenizer, prompt_text, n_iter=args.n_iter, **kwargs)
-        print(out_loop)
+        print_output(out_loop)
     else:
         print(f"── OUTPUT (n_iter={args.n_iter}) " + "─" * 38)
         out = generate(model, tokenizer, prompt_text, n_iter=args.n_iter, **kwargs)
-        print(out)
+        print_output(out)
 
 
 if __name__ == "__main__":
