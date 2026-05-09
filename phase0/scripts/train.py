@@ -11,6 +11,7 @@ TensorBoard:
 """
 
 import argparse, sys, os, math, json, time
+from dataclasses import asdict
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
 # Disable HuggingFace tokenizer parallelism to avoid deadlocks with multi-worker DataLoader
@@ -142,10 +143,12 @@ def split_dataset(dataset, ratios=(0.8, 0.1, 0.1), seed=42):
 
 def save_checkpoint_meta(path: str, cfg: Phase0Config, args, **extra) -> None:
     meta_path = path + ".meta.json"
+    cfg_dict = asdict(cfg)
+    cfg_dict["n_iter"] = args.n_iter
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(
             {
-                "cfg": cfg.__dict__,
+                "cfg": cfg_dict,
                 "args": vars(args),
                 **extra,
             },
@@ -519,7 +522,7 @@ def main():
                         "global_step": global_step,
                         "epoch":       epoch,
                         "best_ppl":    best_ppl,
-                        "cfg":         cfg.__dict__,
+                        "cfg":         {**asdict(cfg), "n_iter": args.n_iter},
                         "args":        vars(args),
                     },
                     tmp_ckpt,

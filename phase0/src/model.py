@@ -51,6 +51,7 @@ class Phase0Config:
     n_iter:               int            = 4
     connect_type:         str            = "residual"   # "residual" | "mlp" | "gated" | "iter_aware"
     bottleneck_ratio:     float          = 0.25
+    max_iter_emb:         int            = 8
     k_bptt:               Optional[int]  = 2         # None = full unroll
     # Auxiliary multi-step loss (from Ouro paper Section 3.1)
     aux_loss_weight:      float          = 0.0   # weight of summed per-iter losses
@@ -59,10 +60,21 @@ class Phase0Config:
     consistency_weight:   float          = 0.0   # L2 ||h_out_i - h_out_{i-1}||² / d
 
     def validate(self, num_layers: int):
+        valid_connect = {"residual", "mlp", "gated", "iter_aware"}
         assert 0 <= self.loop_start < self.loop_end <= num_layers, (
             f"Invalid loop range [{self.loop_start}, {self.loop_end}) "
             f"for model with {num_layers} layers"
         )
+        if self.connect_type not in valid_connect:
+            raise ValueError(f"Invalid connect_type={self.connect_type!r}; expected one of {sorted(valid_connect)}")
+        if self.n_iter < 0:
+            raise ValueError("n_iter must be >= 0")
+        if self.bottleneck_ratio <= 0:
+            raise ValueError("bottleneck_ratio must be > 0")
+        if self.k_bptt is not None and self.k_bptt <= 0:
+            raise ValueError("k_bptt must be None or > 0")
+        if self.max_iter_emb <= 0:
+            raise ValueError("max_iter_emb must be > 0")
 
 
 # ---------------------------------------------------------------------------
@@ -109,7 +121,8 @@ class Phase0Model(nn.Module):
         if cfg.connect_type == "residual":
             self.connect = ResidualConnectLayer(bb.d_model, cfg.bottleneck_ratio)
         elif cfg.connect_type == "iter_aware":
-            self.connect = IterationAwareConnectLayer(bb.d_model, cfg.bottleneck_ratio)
+            max_iter = max(cfg.max_iter_emb, cfg.n_iter)
+            self.connect = IterationAwareConnectLayer(bb.d_model, cfg.bottleneck_ratio, max_iter=max_iter)
         elif cfg.connect_type == "gated":
             self.connect = GatedResidualConnectLayer(bb.d_model, cfg.bottleneck_ratio)
         else:
@@ -269,7 +282,7 @@ class Phase0Model(nn.Module):
                 elif isinstance(self.connect, GatedResidualConnectLayer):
                     h_next = self.connect(h_out, h_prev)
                 else:
-                    h_next = self.connect(h_out)
+                    h_next = self.connect(h_out, h_prev)
 
                 # Cheap diagnostics: if update_norm_ratio is near 0, the
                 # connect layer is effectively a no-op and extra loop compute

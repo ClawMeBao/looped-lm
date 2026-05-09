@@ -34,23 +34,26 @@ from common.data_utils import load_text_dataset, load_instruction_dataset, load_
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def _compute_ppl(logits_list, labels_list) -> float:
-    """Tính PPL từ accumulated logits + labels."""
-    total_loss, total_tok = 0.0, 0
-    for logits, labels in zip(logits_list, labels_list):
-        # shift: predict token i+1 from position i
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
-        loss = torch.nn.functional.cross_entropy(
-            shift_logits.view(-1, shift_logits.size(-1)),
-            shift_labels.view(-1),
-            ignore_index=-100,
-            reduction="sum",
-        )
-        n_tok = (shift_labels != -100).sum().item()
-        total_loss += loss.item()
-        total_tok  += n_tok
-    return math.exp(min(total_loss / max(total_tok, 1), 20))
+def _loss_sum_from_logits(logits: torch.Tensor, labels: torch.Tensor) -> tuple[float, int]:
+    """Return summed CE loss and valid-token count for one batch."""
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+    n_tok = int((shift_labels != -100).sum().item())
+    if n_tok == 0:
+        return 0.0, 0
+    loss = torch.nn.functional.cross_entropy(
+        shift_logits.view(-1, shift_logits.size(-1)),
+        shift_labels.view(-1),
+        ignore_index=-100,
+        reduction="sum",
+    )
+    return float(loss.item()), n_tok
+
+
+def _ppl_from_loss(total_loss: float, total_tok: int) -> float:
+    if total_tok == 0:
+        return float("inf")
+    return math.exp(min(total_loss / total_tok, 20))
 
 
 def _unpack_batch(batch, device):
@@ -78,14 +81,15 @@ def eval_looped_details(model: Phase0Model, loader, device, n_iter: int, desc: s
     model.cfg.n_iter = n_iter
     model.eval()
 
-    logits_list, labels_list = [], []
+    total_loss, total_tok = 0.0, 0
     connect_sums: dict[str, float] = {}
     connect_count = 0
     for batch in tqdm(loader, desc=desc or f"  n_iter={n_iter}", leave=False, ncols=70):
         ids, labels = _unpack_batch(batch, device)
         out = model(input_ids=ids, labels=labels)
-        logits_list.append(out.logits.cpu())
-        labels_list.append(labels.cpu())
+        batch_loss, batch_tok = _loss_sum_from_logits(out.logits, labels)
+        total_loss += batch_loss
+        total_tok += batch_tok
         connect_metrics = model.last_connect_metrics()
         if connect_metrics:
             for key, value in connect_metrics.items():
@@ -97,7 +101,7 @@ def eval_looped_details(model: Phase0Model, loader, device, n_iter: int, desc: s
         key: value / max(connect_count, 1)
         for key, value in connect_sums.items()
     }
-    metrics["ppl"] = _compute_ppl(logits_list, labels_list)
+    metrics["ppl"] = _ppl_from_loss(total_loss, total_tok)
     return metrics
 
 
@@ -153,16 +157,17 @@ def eval_true_baseline(model_name: str, loader, device, dtype, desc: str = "") -
     )
     base.eval()
 
-    logits_list, labels_list = [], []
+    total_loss, total_tok = 0.0, 0
     for batch in tqdm(loader, desc=desc or "  true baseline", leave=False, ncols=70):
         ids, labels = _unpack_batch(batch, device)
         out = base(input_ids=ids, labels=labels)
-        logits_list.append(out.logits.cpu())
-        labels_list.append(labels.cpu())
+        batch_loss, batch_tok = _loss_sum_from_logits(out.logits, labels)
+        total_loss += batch_loss
+        total_tok += batch_tok
 
     del base
     torch.cuda.empty_cache()
-    return _compute_ppl(logits_list, labels_list)
+    return _ppl_from_loss(total_loss, total_tok)
 
 
 # ---------------------------------------------------------------------------

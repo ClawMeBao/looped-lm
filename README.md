@@ -13,8 +13,8 @@ looped-lm/
 │
 ├── common/                     ← Shared code cho tất cả phases
 │   ├── backbone.py             ← load_backbone(): unpack + freeze pretrained model
-│   ├── connect_layer.py        ← MLPConnectLayer (B) + GatedResidualConnectLayer (C)
-│   └── data_utils.py           ← TokenizedTextDataset, load_text_dataset()
+│   ├── connect_layer.py        ← Residual + MLP/Gated/IterAware ablations
+│   └── data_utils.py           ← Text/chat/GLM dataset utilities
 │
 ├── phase0/                     ← ✅ DONE — Fixed n_iter, no exit gate
 │   ├── src/
@@ -56,18 +56,22 @@ pip install -r requirements.txt
 
 ---
 
-## Phase 0 — ✅ Completed
+## Phase 0 — ✅ Structurally usable
 
 **Goal:** Verify connect layer có thể học được cách remap distribution gap giữa loop block output và input.
 
-**Result (from PHASE0_REPORT.md):**
+**Current result (from PHASE0_REPORT.md):**
 
-| Connect type | Best PPL | Baseline PPL | n_iter stability |
-|---|---|---|---|
-| MLP | **59.0** (n_iter=1) | ~9,972 | ❌ Degrades 59→9860 |
-| **GatedResidual** | **98.4** (n_iter=2) | ~10,249 | ✅ Flat ~98 for n_iter 1–4 |
+| Item | Current status |
+|---|---|
+| Default connect | `residual` |
+| Loop topology | `prefix -> loop -> (connect -> loop)* -> suffix` |
+| GLM 3-epoch final PPL | 3.3054 on current validation split |
+| Connect update ratio | ~2.2-2.4% hidden norm |
+| Repetition-collapse bug | Fixed in current residual path |
+| Final proof of model quality | Pending held-out generation/eval sweep |
 
-→ **GatedResidual** là default cho Phase 1+ vì depth-invariant.
+→ Phase 0 hạ tầng đã ổn để đánh giá nghiêm túc hơn và thử cải tiến kiến trúc. PPL thấp không được xem là bằng chứng đủ nếu chưa kiểm tra generation/repetition.
 
 ### Quick start
 
@@ -75,16 +79,38 @@ pip install -r requirements.txt
 # 1. Smoke test
 python phase0/scripts/test_forward.py
 
-# 2. Train (300 steps ~36s trên GPU)
-python phase0/scripts/train.py --max_steps 300 --curriculum
+# 2. Train GLM local subset
+python phase0/scripts/train.py \
+  --connect_type residual \
+  --n_iter 4 \
+  --curriculum \
+  --epochs 3 \
+  --dataset_type glm \
+  --local_dataset_dir data/glm_dataset/train_10k \
+  --no_think \
+  --seq_len 512 \
+  --batch_size 1 \
+  --lr 5e-5
 
 # 3. Eval
-python phase0/scripts/eval.py --checkpoint phase0/checkpoints/best_connect.pt
+python phase0/scripts/eval.py \
+  --checkpoint phase0/checkpoints/residual_seq512_3epoch/final_connect.pt \
+  --connect_type residual \
+  --dataset_type glm \
+  --local_dataset_dir data/glm_dataset/train_10k \
+  --no_think \
+  --seq_len 512 \
+  --max_iter 4 \
+  --skip_true_baseline
 
 # 4. Generate
 python phase0/scripts/inference.py \
-    --checkpoint phase0/checkpoints/best_connect.pt \
-    --compare --prompt "The history of AI"
+  --checkpoint phase0/checkpoints/residual_seq512_3epoch/final_connect.pt \
+  --connect_type residual \
+  --compare \
+  --greedy \
+  --no_think \
+  --prompt "The history of AI"
 ```
 
 ---
@@ -128,9 +154,8 @@ input → embed → PREFIX (L0–7, frozen)
                     ║ h_out
                     ▼
              ┌──────────────┐
-             │ ConnectLayer │ ← trainable (~6M params)
-             │ GatedResidual│   gate * transform(h_out)
-             │              │   + (1-gate) * h_prev
+             │ ConnectLayer │ ← trainable (~2.1M params)
+             │ Residual     │   h_prev + scale * delta(h_out)
              └──────┬───────┘
                     │
              [ExitGate?]  ← Phase 1+
@@ -147,7 +172,7 @@ input → embed → PREFIX (L0–7, frozen)
 | Base model | Qwen3-1.7B (1.7B params) |
 | d_model | 2048 |
 | Loop block depth | 12 layers (43% of model) |
-| Connect layer params | ~6M (0.3%) |
+| Connect layer params | ~2.1M for residual |
 | Exit gate params | ~1.5M (Phase 1) |
-| Training dataset | WikiText-2 |
-| Training time (300 steps) | ~36s on GPU |
+| Training dataset | GLM local subset (`data/glm_dataset/train_10k`) |
+| Current status | Structurally usable; held-out generation/eval pending |

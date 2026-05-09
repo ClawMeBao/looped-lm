@@ -98,15 +98,10 @@ def generate(model, tokenizer, prompt_text: str, max_new_tokens: int,
              n_iter: int, temperature: float, top_k: int,
              do_sample: bool, device) -> str:
     """
-    Autoregressive generation with prefix caching.
+    Autoregressive generation without KV cache.
 
-    Prefix (input prompt) is passed through prefix_layers once, then the
-    cached hidden state is reused each step. Only the loop + suffix re-run
-    on the growing sequence from the cached prefix position onward.
-
-    This avoids re-running prefix_layers O(max_new_tokens) times.
-    The loop block still runs on the full growing context each step because
-    cross-token attention is causal — no KV-cache across loop iterations.
+    Phase 0 reruns the full growing sequence at every token because the looped
+    block does not expose a compatible cache path yet. Correct but slow.
     """
     orig_n = model.cfg.n_iter
     model.cfg.n_iter = n_iter

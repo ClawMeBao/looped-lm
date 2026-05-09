@@ -63,10 +63,11 @@ class ResidualConnectLayer(nn.Module):
 class MLPConnectLayer(nn.Module):
     """
     Non-linear projection với bottleneck:
-        h_j → Linear(d, d_inner) → SiLU → Linear(d_inner, d) → RMSNorm
+        h_j → Linear(d, d_inner) → SiLU → Linear(d_inner, d)
+        output = h_prev + delta
 
     Params (d=2048, d_inner=512): ~2.1M
-    Dùng cho Phase 0 vì đơn giản, dễ debug, gradient ổn định.
+    Kept for ablation. Warm-start is no-op when h_prev is provided.
     """
 
     def __init__(self, d_model: int = 2048, bottleneck_ratio: float = 0.25):
@@ -76,21 +77,23 @@ class MLPConnectLayer(nn.Module):
         self.down_proj = nn.Linear(d_model, d_inner, bias=False)
         self.up_proj   = nn.Linear(d_inner, d_model, bias=False)
         self.act       = nn.SiLU()
-        self.norm      = _build_norm(d_model)
 
-        # Khởi tạo gần identity để tránh training collapse ban đầu
+        # Khởi tạo no-op để tránh training collapse ban đầu.
         nn.init.normal_(self.down_proj.weight, std=0.02)
-        nn.init.zeros_(self.up_proj.weight)   # out = norm(x + 0) ≈ norm(x) lúc đầu
+        nn.init.zeros_(self.up_proj.weight)
 
-    def forward(self, h_j: torch.Tensor) -> torch.Tensor:
+    def forward(self, h_j: torch.Tensor, h_prev: torch.Tensor | None = None) -> torch.Tensor:
         """
         Args:
             h_j: [B, S, d_model] — output của loop block (layer j hidden state)
+            h_prev: [B, S, d_model] — input của loop block iteration hiện tại
         Returns:
             h_i_hat: [B, S, d_model] — remapped để feed vào loop block input
         """
         projected = self.up_proj(self.act(self.down_proj(h_j)))
-        return self.norm(h_j + projected)   # residual để giữ thông tin gốc
+        if h_prev is None:
+            return projected
+        return h_prev + projected
 
 
 # ---------------------------------------------------------------------------
@@ -99,10 +102,10 @@ class MLPConnectLayer(nn.Module):
 
 class GatedResidualConnectLayer(nn.Module):
     """
-    Gated combination giữa transformed h_j và h_i từ iteration trước:
+    Gated residual update từ transformed h_j lên h_i từ iteration trước:
         gate      = sigmoid(W_g @ h_j)
         transform = MLP(h_j)
-        output    = gate * transform + (1 - gate) * h_i_prev
+        output    = h_i_prev + gate * transform
 
     Đặc điểm:
     - gate → 1: lấy nhiều từ new iteration (aggressive update)
@@ -125,13 +128,11 @@ class GatedResidualConnectLayer(nn.Module):
         # Gate network (scalar per token)
         self.gate_proj = nn.Linear(d_model, 1, bias=True)
 
-        self.norm = _build_norm(d_model)
-
-        # Init: transform gần zero ban đầu, gate gần 0.5 (neutral)
+        # Init: transform gần zero ban đầu, nên output ban đầu đúng bằng h_i_prev.
         nn.init.normal_(self.transform[0].weight, std=0.02)
         nn.init.zeros_(self.transform[2].weight)
         nn.init.zeros_(self.gate_proj.weight)
-        nn.init.zeros_(self.gate_proj.bias)   # sigmoid(0) = 0.5
+        nn.init.zeros_(self.gate_proj.bias)
 
     def forward(
         self,
@@ -149,8 +150,7 @@ class GatedResidualConnectLayer(nn.Module):
         gate = torch.sigmoid(self.gate_proj(h_j))   # [B, S, 1]
         transformed = self.transform(h_j)            # [B, S, d_model]
 
-        blended = gate * transformed + (1.0 - gate) * h_i_prev
-        return self.norm(blended)
+        return h_i_prev + gate * transformed
 
     def gate_stats(self, h_j: torch.Tensor) -> dict:
         """Utility: trả về gate statistics để debug training."""
@@ -177,15 +177,14 @@ class IterationAwareConnectLayer(nn.Module):
     2. Iteration embedding — biết đang ở loop step nào → context-aware blending
     3. Channel-wise gate [B, S, d_model] thay vì scalar [B, S, 1] → per-dim control
     4. Gate dùng cả h_j và h_prev (concatenated) → richer gating signal
-    5. Post-norm output
+    5. No-op warm-start: output starts exactly at h_prev
 
     Forward:
         h_j_n    = pre_norm_j(h_j) + iter_emb[step_idx]
         h_prev_n = pre_norm_prev(h_prev)
         gate     = sigmoid(gate_proj(cat([h_j_n, h_prev_n])))   # [B, S, d]
         transform = MLP(h_j_n)
-        blended  = gate * transform + (1 - gate) * h_prev_n
-        return post_norm(blended)
+        return h_prev + gate * transform
 
     Params (d=2048, d_inner=512, max_iter=8): ~12M
     """
@@ -214,8 +213,6 @@ class IterationAwareConnectLayer(nn.Module):
 
         # Channel-wise gate: uses BOTH h_j and h_prev → richer signal
         self.gate_proj = nn.Linear(d_model * 2, d_model, bias=True)
-
-        self.post_norm = _build_norm(d_model)
 
         # Init: transform near zero → output ≈ h_prev at start (safe warm-start)
         nn.init.normal_(self.transform[0].weight, std=0.02)
@@ -250,8 +247,7 @@ class IterationAwareConnectLayer(nn.Module):
         gate     = torch.sigmoid(self.gate_proj(combined))            # [B, S, d]
 
         transformed = self.transform(h_j_n)                           # [B, S, d]
-        blended = gate * transformed + (1.0 - gate) * h_prev_n
-        return self.post_norm(blended)
+        return h_prev + gate * transformed
 
     def gate_stats(self, h_j: torch.Tensor, h_prev: torch.Tensor, step_idx: int = 0) -> dict:
         """Utility: gate statistics để debug training."""

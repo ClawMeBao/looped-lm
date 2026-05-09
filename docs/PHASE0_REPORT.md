@@ -1,5 +1,351 @@
 # LoopedLM — Phase 0 Report
 
+> Current status report after fixing the loop topology, residual connect layer,
+> diagnostics, and GLM training pipeline.
+
+Last updated: 2026-05-09
+
+---
+
+## Current Summary
+
+Phase 0 is now structurally usable. The old low-PPL-but-repetitive behavior was
+not a trustworthy success signal: it came from a combination of unsafe connect
+initialization, an incorrect recurrent topology, and insufficient generation
+diagnostics.
+
+Current default:
+
+| Item | Value |
+|---|---|
+| Base model | `Qwen/Qwen3-1.7B` |
+| Loop block | layers `[8, 20)` |
+| Prefix | layers `[0, 8)` |
+| Suffix | layers `[20, 28)` |
+| Default connect | `residual` |
+| Default `n_iter` | 4 |
+| Default `k_bptt` | 2 |
+| Trainable params | connect layer only |
+| Dataset used in latest run | `data/glm_dataset/train_10k` |
+| Sequence length | 512 |
+
+Correct loop topology:
+
+```text
+n_iter <= 1:
+    embed -> prefix -> loop -> suffix -> norm -> lm_head
+
+n_iter >= 2:
+    embed -> prefix
+          -> loop
+          -> (connect -> loop) repeated between iterations
+          -> suffix -> norm -> lm_head
+```
+
+The final loop output goes directly to the suffix. Connect is not applied after
+the last loop iteration.
+
+---
+
+## Current Connect Layer
+
+Default `ResidualConnectLayer`:
+
+```python
+delta = up_proj(SiLU(down_proj(pre_norm(h_j))))
+h_next = h_prev + residual_scale * delta
+```
+
+Initialization:
+
+| Parameter | Init |
+|---|---|
+| `down_proj` | normal std=0.02 |
+| `up_proj` | zeros |
+| `residual_scale` | 0.01 |
+
+At initialization, `h_next == h_prev`. This keeps the recurrent hidden state on
+the original loop-input manifold and lets training learn only the correction.
+
+Legacy variants are still available for ablation, but have also been changed to
+safe no-op warm-starts:
+
+| Connect type | Init behavior |
+|---|---|
+| `residual` | `h_prev + scale * delta`, exact no-op |
+| `mlp` | `h_prev + delta`, exact no-op |
+| `gated` | `h_prev + gate * transform(h_j)`, exact no-op |
+| `iter_aware` | `h_prev + gate * transform(pre_norm(h_j)+iter_emb)`, exact no-op |
+
+Smoke check:
+
+```text
+[residual, mlp, gated, iter_aware] max_abs(output - h_prev)
+[0.0, 0.0, 0.0, 0.0]
+```
+
+---
+
+## Latest Fixes
+
+| Area | Fix |
+|---|---|
+| Loop topology | connect is applied only between loop iterations, not after final loop |
+| Connect init | `mlp`, `gated`, `iter_aware` now warm-start as no-op against `h_prev` |
+| Config validation | invalid `connect_type`, bad `n_iter`, bad `k_bptt`, etc. now raise errors |
+| Iter-aware max step | embedding size is `max(cfg.max_iter_emb, cfg.n_iter)` |
+| Eval PPL | streaming loss; no longer stores all logits in RAM |
+| GLM loading | `max_samples` applied before Python message-list conversion |
+| Checkpoint metadata | saves target `args.n_iter`, not current curriculum depth |
+| Inference docs | clarified that Phase 0 has no KV cache and reruns full context |
+
+Verification run after these fixes:
+
+```bash
+python -m py_compile phase0/src/model.py common/connect_layer.py common/backbone.py \
+  common/data_utils.py common/__init__.py phase0/scripts/train.py \
+  phase0/scripts/eval.py phase0/scripts/inference.py phase0/scripts/test_forward.py
+
+git diff --check
+```
+
+Both passed.
+
+---
+
+## Current TensorBoard Diagnostics
+
+The training script now logs metrics that are specifically useful for judging a
+looped model:
+
+| Tag | Meaning |
+|---|---|
+| `train/loss_step` | total loss per optimizer step |
+| `train/lm_loss_step` | LM-only loss |
+| `train/grad_norm` | clipped gradient norm |
+| `train/n_iter` | current curriculum depth |
+| `train/connect/update_norm_ratio_mean_step` | connect update norm / previous hidden norm |
+| `train/connect/output_cosine_to_prev_mean_step` | cosine between connect output and previous hidden |
+| `eval/ppl_n{n}` | PPL for each loop depth |
+| `eval/best_n_iter` | best loop depth in eval sweep |
+| `eval/connect/*_n{n}` | connect diagnostics per depth |
+| `runtime/tokens_per_sec` | throughput |
+| `runtime/gpu_mem_allocated_gb` | peak CUDA memory in the log window |
+
+Interpretation:
+
+- Very low update ratio means extra loop compute may be mostly no-op.
+- Very high update ratio means hidden-state drift risk.
+- Cosine near 1.0 is expected for residual connect, but it must be paired with
+  nonzero update ratio and generation checks.
+- PPL alone is not enough; repetition metrics and qualitative generation remain
+  required.
+
+Default cadence:
+
+| Setting | Default |
+|---|---|
+| `--log_steps` | 20 |
+| `--eval_steps` | 250 |
+| `--save_every` | 100 |
+
+---
+
+## Latest GLM Run
+
+Training command:
+
+```bash
+python phase0/scripts/train.py \
+  --connect_type residual \
+  --n_iter 4 \
+  --curriculum \
+  --epochs 3 \
+  --eval_steps 500 \
+  --eval_max_batches 50 \
+  --log_steps 20 \
+  --save_every 500 \
+  --dataset_type glm \
+  --local_dataset_dir data/glm_dataset/train_10k \
+  --no_think \
+  --seq_len 512 \
+  --batch_size 1 \
+  --num_workers 0 \
+  --lr 5e-5 \
+  --output_dir phase0/checkpoints/residual_seq512_3epoch
+```
+
+Checkpoint summary:
+
+| Checkpoint | Step | Metric |
+|---|---:|---:|
+| `best_connect.pt` | 18,500 | eval PPL 3.4800 |
+| `final_connect.pt` | 22,836 | validate PPL 3.3054 |
+
+Final residual state:
+
+| Parameter | Value |
+|---|---:|
+| `residual_scale` | 0.015625 |
+| `up_proj` norm | 7.692 |
+| `down_proj` norm | 21.921 |
+
+Smoke eval on 100 samples:
+
+| n_iter | PPL | update ratio | cosine |
+|---:|---:|---:|---:|
+| 0 | 4.50 | - | - |
+| 1 | 4.50 | - | - |
+| 2 | 2.42 | 0.02423 | 0.99863 |
+| 3 | 2.27 | 0.02336 | 0.99882 |
+| 4 | 2.28 | 0.02218 | 0.99898 |
+
+Best loop depth in this sampled eval was `n_iter=3`.
+
+Interpretation:
+
+- The connect layer is not a pure no-op: update ratio is about 2.2-2.4%.
+- The state remains close to the previous hidden state, which matches the
+  intended conservative residual behavior.
+- PPL improved on the sampled GLM split, but this does not by itself prove the
+  looped model is better. Generation and held-out evaluation are still needed.
+
+---
+
+## Generation Status
+
+Earlier unsafe `iter_aware` runs produced low PPL but collapsed generation:
+
+| Loop depth | Symptom |
+|---|---|
+| `n_iter=2` | repeated LaTeX-like token pattern |
+| `n_iter=3` | repeated Chinese token |
+| `n_iter=4` | repeated short parenthesized token |
+
+After switching to corrected residual connect and fixed loop topology, a 1k-step
+run produced coherent output on tested prompts and did not show immediate
+repetition collapse.
+
+The final 3-epoch checkpoint still needs a fresh generation sweep after the
+latest code fixes. PPL should not be treated as final proof.
+
+Recommended check:
+
+```bash
+python phase0/scripts/inference.py \
+  --checkpoint phase0/checkpoints/residual_seq512_3epoch/final_connect.pt \
+  --connect_type residual \
+  --n_iter 4 \
+  --compare \
+  --greedy \
+  --no_think \
+  --max_new_tokens 256 \
+  --prompt "Explain the history of artificial intelligence"
+```
+
+Watch the printed repetition stats:
+
+- `distinct`
+- `repeat_bigram`
+- `char_distinct`
+- `repeat_trigram`
+
+---
+
+## Current Pass/Fail Assessment
+
+| Criterion | Status |
+|---|---|
+| Forward/backward path | PASS |
+| Frozen backbone, connect-only training | PASS |
+| `n_iter=0/1` full-backbone baseline path | PASS |
+| Correct loop topology | PASS |
+| Safe no-op warm-start for connect variants | PASS |
+| Streaming eval PPL | PASS |
+| TensorBoard loop diagnostics | PASS |
+| Residual connect changes hidden states nontrivially | PASS |
+| Low-PPL GLM training | PASS |
+| Generation robustness on final 3-epoch checkpoint | PENDING |
+| Held-out generalization evaluation | PENDING |
+
+Overall verdict:
+
+```text
+Phase 0 infrastructure is now in a usable state.
+The residual path no longer shows the previous obvious repetition-collapse bug.
+The model is not yet proven better than the base model; it is ready for stricter
+evaluation before model-structure experiments.
+```
+
+---
+
+## Recommended Next Steps
+
+1. Run generation comparison on the final 3-epoch checkpoint across multiple
+   prompts and loop depths `n_iter=0..4`.
+2. Add a small scripted eval suite that stores PPL and repetition metrics
+   together.
+3. Evaluate on held-out GLM rows outside the 10k training subset.
+4. Compare `n_iter=2`, `n_iter=3`, and `n_iter=4`; if `n_iter=3` remains best,
+   do not force `n_iter=4`.
+5. Only after generation is stable, test architectural improvements:
+   iteration-aware residual, adaptive residual scale, or selective LoRA in loop
+   layers.
+
+---
+
+## Useful Current Commands
+
+Smoke forward:
+
+```bash
+python phase0/scripts/test_forward.py \
+  --connect_type residual \
+  --n_iter 4 \
+  --seq_len 32 \
+  --batch_size 1
+```
+
+Eval checkpoint:
+
+```bash
+python phase0/scripts/eval.py \
+  --checkpoint phase0/checkpoints/residual_seq512_3epoch/final_connect.pt \
+  --connect_type residual \
+  --max_iter 4 \
+  --dataset_type glm \
+  --local_dataset_dir data/glm_dataset/train_10k \
+  --no_think \
+  --seq_len 512 \
+  --batch_size 1 \
+  --max_samples 100 \
+  --skip_true_baseline
+```
+
+Inference comparison:
+
+```bash
+python phase0/scripts/inference.py \
+  --checkpoint phase0/checkpoints/residual_seq512_3epoch/final_connect.pt \
+  --connect_type residual \
+  --n_iter 4 \
+  --compare \
+  --greedy \
+  --no_think \
+  --max_new_tokens 256 \
+  --prompt "Explain the history of artificial intelligence"
+```
+
+---
+
+## Archived Legacy Report
+
+The remaining sections below are kept as historical context. They include old
+WikiText/GatedResidual/IterationAware experiments and several conclusions that
+have been superseded by the current residual-connect implementation above.
+
+# LoopedLM — Phase 0 Legacy Report
+
 > **Objective:** Validate that a trainable connect layer inserted into a frozen Qwen3-1.7B backbone
 > can reduce perplexity degradation when the loop block is executed iteratively, while confirming
 > the `n_iter=0` path reproduces the true HF model baseline exactly.

@@ -405,12 +405,12 @@ def load_glm_dataset(
         ds.save_to_disk(local_split_dir)
         print(f"[data] ✓ Saved {len(ds)} rows → {local_split_dir}")
 
+    if max_samples is not None:
+        ds = ds.select(range(min(max_samples, len(ds))))
+
     messages_list: list[list[dict]] = [
         _normalize_sharegpt(row["conversations"]) for row in ds
     ]
-
-    if max_samples is not None:
-        messages_list = messages_list[:max_samples]
 
     think_tag = " [no_think]" if no_think else " [think]"
     print(f"[data] Loaded {dataset_name} ({split}){think_tag}: {len(messages_list)} conversations")
