@@ -353,6 +353,23 @@ python phase0/scripts/inference.py \
   --prompt "Explain the history of artificial intelligence"
 ```
 
+Batch generation comparison:
+
+```bash
+python phase0/scripts/compare_generation.py \
+  --checkpoint phase0/checkpoints/residual_seq512_3epoch/final_connect.pt \
+  --connect_type residual \
+  --n_iters 0,2,3,4 \
+  --greedy \
+  --no_think \
+  --max_new_tokens 256 \
+  --output phase0/reports/generation_compare.jsonl
+```
+
+The script writes one JSONL row per `(prompt, n_iter)` with output text,
+format-validity flags, repetition metrics, and latency. It also prints a summary
+table for quick comparison against the `n_iter=0` base path.
+
 ---
 
 ## Archived Legacy Report

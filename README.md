@@ -111,6 +111,15 @@ python phase0/scripts/inference.py \
   --greedy \
   --no_think \
   --prompt "The history of AI"
+
+# 5. Batch generation comparison
+python phase0/scripts/compare_generation.py \
+  --checkpoint phase0/checkpoints/residual_seq512_3epoch/final_connect.pt \
+  --connect_type residual \
+  --n_iters 0,2,3,4 \
+  --greedy \
+  --no_think \
+  --max_new_tokens 256
 ```
 
 ---
