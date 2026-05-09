@@ -98,6 +98,7 @@ Smoke check:
 | GLM loading | `max_samples` applied before Python message-list conversion |
 | Checkpoint metadata | saves target `args.n_iter`, not current curriculum depth |
 | Inference docs | clarified that Phase 0 has no KV cache and reruns full context |
+| No-think response format | `--no_think` now strips reasoning text but still supervises Qwen's empty `<think>...</think>` wrapper |
 
 Verification run after these fixes:
 
@@ -110,6 +111,17 @@ git diff --check
 ```
 
 Both passed.
+
+Additional tokenizer check for `--no_think` labels:
+
+```text
+<think>
+
+</think>
+
+Hello.<|im_end|>
+has_end_think True
+```
 
 ---
 
@@ -228,6 +240,11 @@ repetition collapse.
 
 The final 3-epoch checkpoint still needs a fresh generation sweep after the
 latest code fixes. PPL should not be treated as final proof.
+
+Important: checkpoints trained before the no-think label fix may have learned an
+incomplete response format, e.g. starting with `<think>` but failing to emit
+`</think>`. Retrain or continue training with the fixed data pipeline before
+judging final no-think generation quality.
 
 Recommended check:
 

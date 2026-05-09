@@ -169,6 +169,7 @@ def dataset_diagnostics(dataset, name: str, max_items: int = 256) -> None:
     assistant_tokens = 0
     total_tokens = 0
     likely_truncated = 0
+    end_think_labels = 0
 
     for i in range(n):
         item = dataset[i]
@@ -183,6 +184,7 @@ def dataset_diagnostics(dataset, name: str, max_items: int = 256) -> None:
         total_tokens += int(labels.numel())
         if input_ids.numel() > 0 and labels[-1].item() != -100:
             likely_truncated += 1
+        end_think_labels += int((labels == 151668).any().item())
 
     if total_tokens == 0:
         return
@@ -190,7 +192,8 @@ def dataset_diagnostics(dataset, name: str, max_items: int = 256) -> None:
         f"[data:{name}] checked={n}  "
         f"assistant_token_ratio={assistant_tokens/total_tokens:.3f}  "
         f"zero_grad={zero_grad/n:.3f}  "
-        f"likely_truncated={likely_truncated/n:.3f}"
+        f"likely_truncated={likely_truncated/n:.3f}  "
+        f"end_think_labeled={end_think_labels/n:.3f}"
     )
 
 

@@ -127,7 +127,8 @@ def _find_assistant_spans(
     content_end:   index right after <|im_end|> (exclusive, includes im_end itself)
 
     skip_think_wrapper=True: if the content starts with <think>...\n\n</think>\n\n,
-    advance content_start past it (used with no_think=True to train on answer only).
+    advance content_start past it. This is kept for ablations only; Phase 0 no_think
+    should not use it because Qwen chat generation expects the empty think wrapper.
     """
     spans: list[tuple[int, int]] = []
     h_len = len(header_ids)
@@ -177,14 +178,16 @@ def _build_chat_example(
     Span detection dùng token-ID pattern search (<|im_start|>assistant\\n … <|im_end|>)
     thay vì re-tokenize prefix/end riêng lẻ — tránh BPE boundary mismatch.
 
-    no_think=True: strip <think>…</think> từ content trước khi render template.
+    no_think=True: strip real <think>…</think> reasoning from assistant content before
+    rendering the template, but still supervise the template's empty think wrapper.
 
     Returns (input_ids, labels) tensors or None nếu không có assistant token.
     """
-    # Note: enable_thinking=False does NOT suppress <think> tokens in Qwen3 —
-    # the template always injects an empty <think>\n\n</think> wrapper regardless.
-    # Actual no_think handling is done via _strip_think_tags (content level) +
-    # skip_think_wrapper=True in _find_assistant_spans (label mask level).
+    # Note: enable_thinking=False does NOT suppress <think> tokens in Qwen3.
+    # The template still injects an empty <think>...</think> wrapper. In no_think
+    # mode we remove reasoning text from the content, but we keep wrapper tokens
+    # in the labels so the looped model learns the same response protocol as the
+    # base model: <think>\n</think>\n\nanswer.
     template_kwargs: dict = {}
 
     # Normalise messages: strip unknown fields, inject reasoning or strip think
@@ -235,7 +238,7 @@ def _build_chat_example(
     im_start_id, im_end_id, header_ids = _get_assistant_token_ids(tokenizer)
     spans = _find_assistant_spans(
         full_ids, im_start_id, im_end_id, header_ids,
-        skip_think_wrapper=no_think,
+        skip_think_wrapper=False,
     )
 
     for start, end in spans:
@@ -339,7 +342,8 @@ def load_instruction_dataset(
 
     Caller chịu trách nhiệm split train/eval/test (dùng random_split).
 
-    no_think=True: không inject reasoning → train on answer-only.
+    no_think=True: strip reasoning content but keep the empty Qwen think wrapper
+    in labels so inference preserves `<think>...</think>` response structure.
     """
     from datasets import load_dataset
 
@@ -378,7 +382,8 @@ def load_glm_dataset(
     Khuyến nghị: dùng --max_samples để giới hạn với 1M-row dataset.
     Caller chịu trách nhiệm split train/eval/test.
 
-    no_think=True: strip <think>...</think> từ gpt responses.
+    no_think=True: strip <think>...</think> reasoning from gpt responses, while
+    still supervising the empty Qwen think wrapper produced by the chat template.
     """
     import os
     from datasets import load_dataset, load_from_disk
