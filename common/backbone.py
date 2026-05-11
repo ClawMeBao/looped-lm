@@ -39,6 +39,7 @@ def load_backbone(
     model_name_or_path: str,
     torch_dtype: torch.dtype = torch.bfloat16,
     device_map: str = "auto",
+    use_flash_attention_2: bool = False,
     **kwargs,
 ) -> BackboneComponents:
     """
@@ -46,24 +47,28 @@ def load_backbone(
     BackboneComponents. Freeze toàn bộ params.
 
     Args:
-        model_name_or_path: HuggingFace model id hoặc local path
-        torch_dtype:        dtype để load (bfloat16 recommended)
-        device_map:         "auto" | "cpu" | "cuda:0" | ...
+        model_name_or_path:    HuggingFace model id hoặc local path
+        torch_dtype:           dtype để load (bfloat16 recommended)
+        device_map:            "auto" | "cpu" | "cuda:0" | ...
+        use_flash_attention_2: Enable Flash Attention 2.
+                               Requires: pip install flash-attn --no-build-isolation
+                               Supported: SM >= 7.5 (Turing+: T4, A100, RTX 30xx+).
+                               Speedup: ~2–4× for seq_len >= 1024; reduces VRAM for KV.
 
     Returns:
         BackboneComponents với toàn bộ params frozen
 
     Example:
-        bb = load_backbone("Qwen/Qwen3-1.7B")
-        # bb.layers[8] → DecoderLayer
-        # bb.d_model   → 2048
+        bb = load_backbone("Qwen/Qwen3-1.7B", use_flash_attention_2=True)
     """
-    print(f"[backbone] Loading: {model_name_or_path} ({torch_dtype}) ...")
+    attn_impl = "flash_attention_2" if use_flash_attention_2 else "eager"
+    print(f"[backbone] Loading: {model_name_or_path} ({torch_dtype}, attn={attn_impl}) ...")
     base = AutoModelForCausalLM.from_pretrained(
         model_name_or_path,
         torch_dtype=torch_dtype,
         device_map=device_map,
         trust_remote_code=True,
+        attn_implementation=attn_impl,
         **kwargs,
     )
     base.eval()

@@ -117,6 +117,13 @@ def parse_args():
     p.add_argument("--baseline_ppl",    type=float, default=None,
                    help="Known baseline PPL to use when --skip_baseline_eval is set. "
                         "Used only for logging/comparison display.")
+    p.add_argument("--flash_attn",      action="store_true",
+                   help="Use Flash Attention 2 for 2–4× faster attention at long seq_len. "
+                        "Requires: pip install flash-attn --no-build-isolation. "
+                        "Supported: SM >= 7.5 (T4, A100, RTX 30/40xx+).")
+    p.add_argument("--grad_accum",      type=int,   default=1,
+                   help="Gradient accumulation steps. Effective batch = batch_size × grad_accum. "
+                        "Use to increase effective batch without more VRAM. Default: 1 (disabled).")
     return p.parse_args()
 
 
@@ -402,7 +409,8 @@ def main():
     )
     if args.n_iter < 2:
         raise ValueError("Training connect layer requires --n_iter >= 2; n_iter=1 is baseline pass-through.")
-    model  = Phase0Model.from_pretrained(cfg, torch_dtype=dtype)
+    model  = Phase0Model.from_pretrained(cfg, torch_dtype=dtype,
+                                         use_flash_attention_2=args.flash_attn)
     device = next(model.connect.parameters()).device
     model.print_summary()
 
@@ -470,7 +478,8 @@ def main():
     warmup_steps    = max(1, int(total_steps * args.warmup_ratio))
 
     optimizer = torch.optim.AdamW(
-        model.trainable_parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.01
+        model.trainable_parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.01,
+        fused=torch.cuda.is_available(),   # fused kernel: 1 launch vs 3 per param tensor
     )
     scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
 
@@ -551,6 +560,23 @@ def main():
         log_tokens = 0
         log_cnt = 0
         log_start = time.perf_counter()
+        # Gradient accumulation state
+        accum_micro  = 0    # micro-batches since last optimizer step
+        _acc_loss    = 0.0  # accumulated loss sum (unscaled)
+        _acc_lm_loss = 0.0
+        _acc_tokens  = 0
+        optimizer.zero_grad()
+
+        def _do_optimizer_step(cur_n, epoch):
+            """Clip + step + zero. Returns grad_norm."""
+            nonlocal accum_micro, _acc_loss, _acc_lm_loss, _acc_tokens
+            gn = torch.nn.utils.clip_grad_norm_(model.trainable_parameters(), args.grad_clip)
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
+            accum_micro = 0
+            _acc_loss = 0.0; _acc_lm_loss = 0.0; _acc_tokens = 0
+            return gn
 
         # cur_n shown in tqdm postfix; compute start value just for clarity
         pbar = tqdm(
@@ -565,41 +591,57 @@ def main():
                 writer.add_scalar("data/skipped_zero_label_batches", 1, global_step)
                 continue
 
-            global_step += 1
-
-            # Update n_iter every step for smooth curriculum
+            # Update n_iter every step for smooth curriculum (use pre-step global_step)
             cur_n = curriculum_n_iter(global_step, total_steps, args.n_iter) \
                     if args.curriculum else args.n_iter
             model.cfg.n_iter = cur_n
 
-            optimizer.zero_grad()
             out = model(input_ids=ids, labels=labels)
-            out.loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.trainable_parameters(), args.grad_clip)
-            optimizer.step()
-            scheduler.step()
+            # Scale loss so accumulated gradient == single-step gradient
+            (out.loss / args.grad_accum).backward()
 
-            loss_val    = out.loss.item()
-            epoch_loss += loss_val
+            loss_val = out.loss.item()
+            metrics  = model.last_loss_metrics()
+            accum_micro  += 1
+            _acc_loss    += loss_val
+            _acc_lm_loss += metrics.get("lm_loss", loss_val)
+            _acc_tokens  += n_tokens
+
+            # Mid-accumulation: update postfix but don't step
+            if accum_micro % args.grad_accum != 0:
+                pbar.set_postfix(
+                    n=cur_n,
+                    loss=f"{loss_val:.4f}",
+                    acc=f"{accum_micro % args.grad_accum}/{args.grad_accum}",
+                )
+                continue
+
+            # ── Optimizer step ────────────────────────────────────────────
+            global_step += 1
+            # Save accumulated stats before _do_optimizer_step resets them
+            step_loss    = _acc_loss    / args.grad_accum
+            step_lm_loss = _acc_lm_loss / args.grad_accum
+            step_tokens  = _acc_tokens
+            grad_norm    = _do_optimizer_step(cur_n, epoch)
+
+            epoch_loss  += step_loss
             epoch_steps += 1
-            metrics = model.last_loss_metrics()
-            if n_tokens > 0:
-                log_loss_tokens += loss_val * n_tokens
-                log_lm_loss_tokens += metrics.get("lm_loss", loss_val) * n_tokens
-                log_tokens += n_tokens
-            log_cnt    += 1
+            log_loss_tokens    += step_loss    * step_tokens
+            log_lm_loss_tokens += step_lm_loss * step_tokens
+            log_tokens         += step_tokens
+            log_cnt            += 1
 
             pbar.set_postfix(
                 n=cur_n,
-                loss=f"{loss_val:.4f}",
+                loss=f"{step_loss:.4f}",
                 lr=f"{scheduler.get_last_lr()[0]:.2e}",
             )
 
             # Per-step loss (always logged for smooth curve)
-            writer.add_scalar("train/loss_step", loss_val, global_step)
-            writer.add_scalar("train/lm_loss_step", metrics.get("lm_loss", loss_val), global_step)
+            writer.add_scalar("train/loss_step", step_loss, global_step)
+            writer.add_scalar("train/lm_loss_step", step_lm_loss, global_step)
             writer.add_scalar("train/grad_norm", float(grad_norm), global_step)
-            writer.add_scalar("train/tokens", n_tokens, global_step)
+            writer.add_scalar("train/tokens", step_tokens, global_step)
             for key, value in model.last_connect_metrics().items():
                 writer.add_scalar(f"train/connect/{key}_step", value, global_step)
             for name in ("aux_loss", "consistency_loss"):
@@ -668,6 +710,12 @@ def main():
 
             if args.max_steps is not None and global_step >= args.max_steps:
                 break
+
+        # Flush any remaining accumulated gradients at epoch end
+        if accum_micro % args.grad_accum != 0:
+            global_step += 1
+            _do_optimizer_step(cur_n, epoch)
+            epoch_steps += 1
 
         pbar.close()
 

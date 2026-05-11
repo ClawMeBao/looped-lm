@@ -253,46 +253,45 @@ class Phase0Model(nn.Module):
         connect_cosines: list[torch.Tensor] = []
 
         for i in range(self.cfg.n_iter):
-            # Truncated BPTT: detach h entering early iterations so gradient
-            # doesn't flow through loop_block more than k_bptt times.
-            # (frozen loop_block params don't accumulate grad regardless,
-            #  but this saves activation memory for connect's gradient path)
-            if (self.cfg.k_bptt is not None
-                    and i < self.cfg.n_iter - self.cfg.k_bptt):
+            # Truncated BPTT: for early iterations (before the last k_bptt),
+            # the input h is detached AND backbone is frozen → no gradient can
+            # flow through this loop block anyway.
+            # torch.no_grad() avoids building the autograd graph entirely,
+            # saving activation memory (~1/(k_bptt/n_iter) of loop activations).
+            is_early = (self.cfg.k_bptt is not None
+                        and i < self.cfg.n_iter - self.cfg.k_bptt)
+            if is_early:
                 h = h.detach()
-
-            # Loop block: frozen weights, activations stay in autograd graph
-            # so gradient can flow back to connect layer
-            h_out = self._run_layers(h, self.loop_layers,
-                                     pos_emb, causal_mask, position_ids, cache_position)
-
-            # Auxiliary LM loss at each iteration. h_out is layer loop_end-1
-            # hidden state, so it must pass through the frozen suffix before
-            # lm_head sees it.
-            if labels is not None and self.cfg.aux_loss_weight > 0.0:
-                h_aux = self._run_layers(h_out, self.suffix_layers,
+                with torch.no_grad():
+                    h_out = self._run_layers(h, self.loop_layers,
+                                             pos_emb, causal_mask, position_ids, cache_position)
+            else:
+                h_out = self._run_layers(h, self.loop_layers,
                                          pos_emb, causal_mask, position_ids, cache_position)
-                h_norm_i = self.norm(h_aux.to(self._dev(self.norm)))
-                logits_i = self.lm_head(h_norm_i.to(self._dev(self.lm_head)))
-                loss_i = nn.CrossEntropyLoss(ignore_index=-100)(
-                    logits_i[..., :-1, :].contiguous().view(-1, logits_i.size(-1)),
-                    labels[..., 1:].contiguous().view(-1).to(logits_i.device),
-                )
-                aux_losses.append(loss_i)
 
-            # Consistency loss: encourage hidden states to converge across iters.
-            # Uses cosine similarity (bounded [0,2]) instead of raw L2 to avoid
-            # exploding loss from outlier features in large transformer hidden states
-            # (Qwen3 has extreme outlier dims; raw L2 can reach 20000+ → spikes).
-            if labels is not None and self.cfg.consistency_weight > 0.0:
-                if h_out_prev is not None:
-                    h_flat     = h_out.view(-1, h_out.size(-1))
-                    h_prev_flat = h_out_prev.detach().view(-1, h_out_prev.size(-1))
-                    diff = 1.0 - torch.nn.functional.cosine_similarity(
-                        h_flat, h_prev_flat, dim=-1
-                    ).mean()
-                    consistency_losses.append(diff)
-                h_out_prev = h_out
+            # Auxiliary LM loss and consistency loss only matter for gradient-
+            # tracked iterations; skip entirely for early (no-grad) iterations.
+            if not is_early:
+                if labels is not None and self.cfg.aux_loss_weight > 0.0:
+                    h_aux = self._run_layers(h_out, self.suffix_layers,
+                                             pos_emb, causal_mask, position_ids, cache_position)
+                    h_norm_i = self.norm(h_aux.to(self._dev(self.norm)))
+                    logits_i = self.lm_head(h_norm_i.to(self._dev(self.lm_head)))
+                    loss_i = nn.CrossEntropyLoss(ignore_index=-100)(
+                        logits_i[..., :-1, :].contiguous().view(-1, logits_i.size(-1)),
+                        labels[..., 1:].contiguous().view(-1).to(logits_i.device),
+                    )
+                    aux_losses.append(loss_i)
+
+                if labels is not None and self.cfg.consistency_weight > 0.0:
+                    if h_out_prev is not None:
+                        h_flat     = h_out.view(-1, h_out.size(-1))
+                        h_prev_flat = h_out_prev.detach().view(-1, h_out_prev.size(-1))
+                        diff = 1.0 - torch.nn.functional.cosine_similarity(
+                            h_flat, h_prev_flat, dim=-1
+                        ).mean()
+                        consistency_losses.append(diff)
+                    h_out_prev = h_out
 
             if i == self.cfg.n_iter - 1:
                 h = h_out
@@ -466,8 +465,10 @@ class Phase0Model(nn.Module):
         cfg: Phase0Config,
         torch_dtype: torch.dtype = torch.bfloat16,
         device_map: str = "auto",
+        use_flash_attention_2: bool = False,
     ) -> "Phase0Model":
-        bb       = load_backbone(cfg.model_name, torch_dtype, device_map)
+        bb       = load_backbone(cfg.model_name, torch_dtype, device_map,
+                                 use_flash_attention_2=use_flash_attention_2)
         instance = cls(bb, cfg)
         device   = next(bb.lm_head.parameters()).device
         instance.connect = instance.connect.to(device=device, dtype=torch_dtype)
