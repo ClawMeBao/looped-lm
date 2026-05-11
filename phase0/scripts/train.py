@@ -63,7 +63,14 @@ def parse_args():
     p.add_argument("--save_every",     type=int,   default=100,
                    help="Save a step checkpoint every N global steps (0=disabled)")
     p.add_argument("--resume",         default=None,
-                   help="Path to a step checkpoint (.pt) to resume training from")
+                   help="Path to a step checkpoint (.pt) to resume training from. "
+                        "If omitted, auto-detects output_dir/resume.pt when it exists.")
+    p.add_argument("--extra_steps",    type=int,   default=None,
+                   help="Train exactly N more optimizer steps from the resume checkpoint "
+                        "and then stop. Creates a fresh cosine LR schedule over extra_steps. "
+                        "Ideal for Kaggle: resume where last session left off without "
+                        "needing to know the current global_step. "
+                        "Example: --extra_steps 500")
     p.add_argument("--batch_size",     type=int,   default=4)
     p.add_argument("--seq_len",        type=int,   default=512)
     p.add_argument("--lr",             type=float, default=1e-4)
@@ -335,6 +342,15 @@ def eval_suite(model, loader, device, args, baseline_ppl, writer, global_step: i
 def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
+
+    # Auto-detect resume checkpoint when --resume is not explicitly provided
+    if not args.resume:  # None or empty string both suppress
+        auto_resume = os.path.join(args.output_dir, "resume.pt")
+        if os.path.exists(auto_resume) and args.resume is None:
+            args.resume = auto_resume
+            print(f"[resume] Auto-detected checkpoint: {auto_resume}")
+            print(f"         Pass --resume '' to start fresh.\n")
+
     log_dir = args.log_dir or os.path.join(args.output_dir, "runs")
     writer  = SummaryWriter(log_dir=log_dir)
     dtype   = {"float32": torch.float32, "bfloat16": torch.bfloat16,
@@ -500,6 +516,28 @@ def main():
         best_ppl    = ckpt_data.get("best_ppl", float("inf"))
         print(f"[resume] Loaded checkpoint from '{args.resume}' "
               f"(step={global_step}, epoch={start_epoch}, best_ppl={best_ppl:.2f})")
+
+    # -- Extra-steps: extend training by N more steps from resume point ----
+    if args.extra_steps is not None:
+        if global_step == 0 and not args.resume:
+            # No checkpoint → treat extra_steps as plain max_steps
+            print(f"[extra_steps] No checkpoint found; treating as --max_steps {args.extra_steps}")
+            args.max_steps = args.extra_steps
+        else:
+            args.max_steps = global_step + args.extra_steps
+            total_steps = args.max_steps           # update for curriculum ramp
+            # Fresh cosine schedule scoped to the extra window
+            new_warmup = max(1, int(args.extra_steps * args.warmup_ratio))
+            scheduler  = get_cosine_schedule_with_warmup(optimizer, new_warmup, args.extra_steps)
+            # Ensure epoch loop runs long enough to consume extra_steps
+            max_epochs = start_epoch + math.ceil(args.extra_steps / steps_per_epoch) + 1
+            print(
+                f"[extra_steps] Resume step={global_step}  "
+                f"extra_steps={args.extra_steps}  → stop at step {args.max_steps}\n"
+                f"             Fresh cosine LR: warmup={new_warmup}, total={args.extra_steps}  "
+                f"epochs budget={max_epochs - start_epoch}"
+            )
+
 
     # -- Training loop -----------------------------------------------------
     for epoch in range(start_epoch, max_epochs + 1):
