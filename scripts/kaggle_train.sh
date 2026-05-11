@@ -61,15 +61,9 @@ echo "============================================================"
 echo "[setup] Installing dependencies..."
 pip install -q -r requirements.txt
 
-# Flash Attention 2: prebuilt wheels are much faster than compiling from source.
-# Skip silently if unavailable (e.g., CPU-only SMOKE=1 runs).
-if [[ "${SMOKE}" != "1" ]]; then
-    echo "[setup] Installing flash-attn (prebuilt wheel)..."
-    pip install -q flash-attn --no-build-isolation || echo "[warn] flash-attn install failed; falling back to eager attention (--flash_attn will be auto-removed)"
-    # If flash-attn is unavailable, remove --flash_attn from the command to avoid crash
-    FLASH_ATTN_AVAILABLE=1
-    python -c "import flash_attn" 2>/dev/null || FLASH_ATTN_AVAILABLE=0
-fi
+# sdpa is PyTorch built-in — no extra packages needed.
+# flash_attention_2 is optional; only has prebuilt wheels for torch <= 2.7.
+# Default: use sdpa (--attn_impl sdpa in CMD below).
 
 # ── 2. GPU sanity check ───────────────────────────────────────────────────────
 python - <<'PYCHECK'
@@ -109,7 +103,7 @@ CMD=(
     --grad_clip      1.0
     --k_bptt         2
     --curriculum                    # ramp n_iter 2→3 over training
-    --flash_attn                    # Flash Attention 2: ~2-4× faster at seq_len>=1024
+    --attn_impl      sdpa           # PyTorch built-in SDPA (no extra package)
 
     # ── Session management (Kaggle-friendly) ─────────────────────────────────
     --save_every     50             # write resume.pt every 50 steps
@@ -130,16 +124,7 @@ if [[ -n "${BASELINE_PPL}" ]]; then
     CMD+=(--skip_baseline_eval --baseline_ppl "${BASELINE_PPL}")
 fi
 
-# Remove --flash_attn if flash-attn package is unavailable
-if [[ "${FLASH_ATTN_AVAILABLE:-0}" == "0" ]]; then
-    FILTERED=()
-    for arg in "${CMD[@]}"; do
-        [[ "${arg}" == "--flash_attn" ]] && continue
-        FILTERED+=("${arg}")
-    done
-    CMD=("${FILTERED[@]}")
-    echo "[warn] --flash_attn removed (flash-attn not available; using eager attention)"
-fi
+# Remove --flash_attn block (no longer used; we now use --attn_impl sdpa)
 
 # Smoke test overrides: tiny data, few steps, no dataset download
 if [[ "${SMOKE}" == "1" ]]; then
@@ -153,14 +138,13 @@ if [[ "${SMOKE}" == "1" ]]; then
         --save_every     5
         --num_workers    0
     )
-    # Remove GLM-specific args and flash_attn (smoke uses CPU/eager)
+    # Remove GLM-specific args (smoke uses text dataset)
     FILTERED=()
     SKIP_NEXT=0
     for arg in "${CMD[@]}"; do
         if [[ "${SKIP_NEXT}" == "1" ]]; then SKIP_NEXT=0; continue; fi
         case "${arg}" in
             --max_samples|--local_dataset_dir) SKIP_NEXT=1; continue ;;
-            --flash_attn) continue ;;
         esac
         FILTERED+=("${arg}")
     done

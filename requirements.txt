@@ -4,3 +4,6 @@ datasets>=2.18.0
 tqdm>=4.66.0
 accelerate>=0.27.0
 tensorboard>=2.16.0  # optional — train.py falls back gracefully if not installed
+# flash-attn is optional: only has prebuilt wheels for torch <= 2.7.
+# For torch >= 2.1, use --attn_impl sdpa (PyTorch built-in, no install needed).
+# To use FA2 explicitly: pip install flash-attn --no-build-isolation

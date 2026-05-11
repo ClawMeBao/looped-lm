@@ -465,10 +465,14 @@ class Phase0Model(nn.Module):
         cfg: Phase0Config,
         torch_dtype: torch.dtype = torch.bfloat16,
         device_map: str = "auto",
+        attn_implementation: str = "sdpa",
+        # Deprecated alias kept for backward compat
         use_flash_attention_2: bool = False,
     ) -> "Phase0Model":
+        if use_flash_attention_2:
+            attn_implementation = "flash_attention_2"
         bb       = load_backbone(cfg.model_name, torch_dtype, device_map,
-                                 use_flash_attention_2=use_flash_attention_2)
+                                 attn_implementation=attn_implementation)
         instance = cls(bb, cfg)
         device   = next(bb.lm_head.parameters()).device
         instance.connect = instance.connect.to(device=device, dtype=torch_dtype)

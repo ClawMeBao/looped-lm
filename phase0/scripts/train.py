@@ -117,10 +117,15 @@ def parse_args():
     p.add_argument("--baseline_ppl",    type=float, default=None,
                    help="Known baseline PPL to use when --skip_baseline_eval is set. "
                         "Used only for logging/comparison display.")
+    p.add_argument("--attn_impl",       default="sdpa",
+                   choices=["sdpa", "flash_attention_2", "eager"],
+                   help="Attention backend. 'sdpa' (default): PyTorch built-in, no extra "
+                        "package needed, uses flash attention kernel automatically. "
+                        "'flash_attention_2': explicit FA2, requires flash-attn package "
+                        "(only prebuilt for torch<=2.7; use sdpa for newer torch). "
+                        "'eager': standard attention, no optimization.")
     p.add_argument("--flash_attn",      action="store_true",
-                   help="Use Flash Attention 2 for 2–4× faster attention at long seq_len. "
-                        "Requires: pip install flash-attn --no-build-isolation. "
-                        "Supported: SM >= 7.5 (T4, A100, RTX 30/40xx+).")
+                   help="[Deprecated] Alias for --attn_impl flash_attention_2.")
     p.add_argument("--grad_accum",      type=int,   default=1,
                    help="Gradient accumulation steps. Effective batch = batch_size × grad_accum. "
                         "Use to increase effective batch without more VRAM. Default: 1 (disabled).")
@@ -410,7 +415,7 @@ def main():
     if args.n_iter < 2:
         raise ValueError("Training connect layer requires --n_iter >= 2; n_iter=1 is baseline pass-through.")
     model  = Phase0Model.from_pretrained(cfg, torch_dtype=dtype,
-                                         use_flash_attention_2=args.flash_attn)
+                                         attn_implementation="flash_attention_2" if args.flash_attn else args.attn_impl)
     device = next(model.connect.parameters()).device
     model.print_summary()
 

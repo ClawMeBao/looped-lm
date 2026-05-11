@@ -39,6 +39,8 @@ def load_backbone(
     model_name_or_path: str,
     torch_dtype: torch.dtype = torch.bfloat16,
     device_map: str = "auto",
+    attn_implementation: str = "sdpa",
+    # Deprecated alias kept for backward compat
     use_flash_attention_2: bool = False,
     **kwargs,
 ) -> BackboneComponents:
@@ -47,21 +49,28 @@ def load_backbone(
     BackboneComponents. Freeze toàn bộ params.
 
     Args:
-        model_name_or_path:    HuggingFace model id hoặc local path
-        torch_dtype:           dtype để load (bfloat16 recommended)
-        device_map:            "auto" | "cpu" | "cuda:0" | ...
-        use_flash_attention_2: Enable Flash Attention 2.
-                               Requires: pip install flash-attn --no-build-isolation
-                               Supported: SM >= 7.5 (Turing+: T4, A100, RTX 30xx+).
-                               Speedup: ~2–4× for seq_len >= 1024; reduces VRAM for KV.
+        model_name_or_path:   HuggingFace model id hoặc local path
+        torch_dtype:          dtype để load (bfloat16 recommended)
+        device_map:           "auto" | "cpu" | "cuda:0" | ...
+        attn_implementation:  Attention backend:
+                              - "sdpa" (default): PyTorch built-in SDPA, uses flash
+                                attention kernel automatically. No extra packages needed.
+                              - "flash_attention_2": Explicit FA2. Requires:
+                                pip install flash-attn --no-build-isolation.
+                                Only has prebuilt wheels for torch <= 2.7.
+                              - "eager": Standard attention, no optimization.
 
     Returns:
         BackboneComponents với toàn bộ params frozen
 
     Example:
-        bb = load_backbone("Qwen/Qwen3-1.7B", use_flash_attention_2=True)
+        bb = load_backbone("Qwen/Qwen3-1.7B")  # sdpa by default
+        bb = load_backbone("Qwen/Qwen3-1.7B", attn_implementation="flash_attention_2")
     """
-    attn_impl = "flash_attention_2" if use_flash_attention_2 else "eager"
+    # Deprecated alias support
+    if use_flash_attention_2:
+        attn_implementation = "flash_attention_2"
+    attn_impl = attn_implementation
     print(f"[backbone] Loading: {model_name_or_path} ({torch_dtype}, attn={attn_impl}) ...")
     base = AutoModelForCausalLM.from_pretrained(
         model_name_or_path,
