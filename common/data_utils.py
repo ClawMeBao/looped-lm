@@ -422,24 +422,53 @@ def load_glm_dataset(
 
     # Thử load theo thứ tự ưu tiên:
     #   1. local_dir trực tiếp  (user save thẳng vào thư mục)
-    #   2. local_dir/split      (code tự tạo khi download)
+    #   2. local_dir/split_N    (partial cache với N samples)
+    #   3. local_dir/split      (full cache)
+    #   4. HuggingFace (streaming nếu max_samples đặt, full download nếu không)
     local_split_dir = os.path.join(local_dir, split)
+    local_partial_dir = (
+        os.path.join(local_dir, f"{split}_{max_samples}")
+        if max_samples is not None
+        else None
+    )
+
     if _is_dataset_dir(local_dir):
         print(f"[data] Loading GLM dataset from local cache: {local_dir}")
         ds = load_from_disk(local_dir)
+        if max_samples is not None:
+            ds = ds.select(range(min(max_samples, len(ds))))
+
+    elif local_partial_dir is not None and _is_dataset_dir(local_partial_dir):
+        print(f"[data] Loading GLM partial cache ({max_samples} rows): {local_partial_dir}")
+        ds = load_from_disk(local_partial_dir)
+
     elif _is_dataset_dir(local_split_dir):
         print(f"[data] Loading GLM dataset from local cache: {local_split_dir}")
         ds = load_from_disk(local_split_dir)
+        if max_samples is not None:
+            ds = ds.select(range(min(max_samples, len(ds))))
+
+    elif max_samples is not None:
+        # Streaming mode: chỉ tải đúng số rows cần, không download toàn bộ 1M
+        print(f"[data] Streaming {dataset_name} (first {max_samples} rows) …")
+        from datasets import Dataset as HFDataset
+        iterable_ds = load_dataset(dataset_name, split=split, streaming=True)
+        rows = list(iterable_ds.take(max_samples))
+        ds = HFDataset.from_list(rows)
+        # Cache partial result để lần sau không cần stream lại
+        if local_partial_dir is not None:
+            os.makedirs(local_partial_dir, exist_ok=True)
+            ds.save_to_disk(local_partial_dir)
+            print(f"[data] ✓ Cached {len(ds)} rows → {local_partial_dir}")
+
     else:
+        # Không có max_samples → download toàn bộ và cache
         print(f"[data] Downloading {dataset_name} from HuggingFace …")
         os.makedirs(local_split_dir, exist_ok=True)
         ds = load_dataset(dataset_name, split=split)
         print(f"[data] Saving to local cache: {local_split_dir}")
         ds.save_to_disk(local_split_dir)
         print(f"[data] ✓ Saved {len(ds)} rows → {local_split_dir}")
-
-    if max_samples is not None:
-        ds = ds.select(range(min(max_samples, len(ds))))
 
     messages_list: list[list[dict]] = [
         _normalize_sharegpt(row["conversations"]) for row in ds
