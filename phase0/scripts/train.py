@@ -104,6 +104,12 @@ def parse_args():
     p.add_argument("--local_dataset_dir", default="data/glm_dataset",
                    help="Local dir to cache GLM dataset (Arrow format). "
                         "Auto-download if not found, then save for reuse.")
+    p.add_argument("--skip_baseline_eval", action="store_true",
+                   help="Skip baseline PPL eval at training start (saves ~5-10 min). "
+                        "Use --baseline_ppl to inject a known value for logging.")
+    p.add_argument("--baseline_ppl",    type=float, default=None,
+                   help="Known baseline PPL to use when --skip_baseline_eval is set. "
+                        "Used only for logging/comparison display.")
     return p.parse_args()
 
 
@@ -459,14 +465,23 @@ def main():
 
     # -- Baseline ----------------------------------------------------------
     model._eval_max_batches = args.eval_max_batches
-    baseline_loss, baseline_ppl = eval_ppl(model, eval_dl, device, n_iter=0, desc="Baseline")
-    model._eval_max_batches = None
-    print(f"Baseline PPL (n_iter=0, all layers): {baseline_ppl:.2f}  loss={baseline_loss:.4f}")
-    if args.dataset_type != "text":
-        mode = "no-think" if args.no_think else "thinking"
-        print(f"  (instruction [{mode}] -- chat-format PPL)\n")
+    if args.skip_baseline_eval:
+        if args.baseline_ppl is not None:
+            baseline_ppl  = args.baseline_ppl
+            baseline_loss = math.log(baseline_ppl)
+            print(f"Baseline PPL (provided): {baseline_ppl:.2f}  [skipped eval]")
+        else:
+            baseline_ppl  = float("inf")
+            baseline_loss = float("inf")
+            print("Baseline PPL: skipped (use --baseline_ppl N to inject known value)")
     else:
-        print()
+        baseline_loss, baseline_ppl = eval_ppl(model, eval_dl, device, n_iter=0, desc="Baseline")
+        print(f"Baseline PPL (n_iter=0, all layers): {baseline_ppl:.2f}  loss={baseline_loss:.4f}")
+        if args.dataset_type != "text":
+            mode = "no-think" if args.no_think else "thinking"
+            print(f"  (instruction [{mode}] -- chat-format PPL)")
+    model._eval_max_batches = None
+    print()
     writer.add_scalar("ppl/baseline", baseline_ppl, 0)
     writer.add_scalar("eval/ppl_n0", baseline_ppl, 0)
 
