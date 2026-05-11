@@ -126,6 +126,10 @@ def parse_args():
                         "'eager': standard attention, no optimization.")
     p.add_argument("--flash_attn",      action="store_true",
                    help="[Deprecated] Alias for --attn_impl flash_attention_2.")
+    p.add_argument("--gradient_checkpointing", action="store_true",
+                   help="Recompute activations during backward instead of storing them. "
+                        "~2× slower backward but reduces activation VRAM by ~10-20×. "
+                        "Enables seq_len=4096 with batch_size=2 on 16GB GPU.")
     p.add_argument("--grad_accum",      type=int,   default=1,
                    help="Gradient accumulation steps. Effective batch = batch_size × grad_accum. "
                         "Use to increase effective batch without more VRAM. Default: 1 (disabled).")
@@ -408,9 +412,10 @@ def main():
         n_iter       = args.n_iter,
         connect_type = args.connect_type,
         k_bptt       = args.k_bptt,
-        aux_loss_weight    = args.aux_loss_weight,
-        aux_loss_gamma     = args.aux_loss_gamma,
-        consistency_weight = args.consistency_weight,
+        aux_loss_weight       = args.aux_loss_weight,
+        aux_loss_gamma        = args.aux_loss_gamma,
+        consistency_weight    = args.consistency_weight,
+        gradient_checkpointing = args.gradient_checkpointing,
     )
     if args.n_iter < 2:
         raise ValueError("Training connect layer requires --n_iter >= 2; n_iter=1 is baseline pass-through.")

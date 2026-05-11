@@ -26,6 +26,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from common.backbone import BackboneComponents, load_backbone
@@ -58,6 +59,10 @@ class Phase0Config:
     aux_loss_gamma:       float          = 0.5   # geometric decay: earlier iters weighted less
     # Optional convergence regularizer
     consistency_weight:   float          = 0.0   # L2 ||h_out_i - h_out_{i-1}||² / d
+    # Gradient checkpointing: recompute activations during backward to save VRAM.
+    # ~2× slower backward but reduces activation memory by ~10-20×.
+    # Enables seq_len=4096 on 16GB GPU. Has no effect on early (no_grad) iterations.
+    gradient_checkpointing: bool         = False
 
     def validate(self, num_layers: int):
         valid_connect = {"residual", "mlp", "gated", "iter_aware"}
@@ -144,11 +149,9 @@ class Phase0Model(nn.Module):
         causal_mask:         torch.Tensor,
         position_ids:        torch.Tensor,
         cache_position:      torch.Tensor,
+        use_checkpoint:      bool = False,
     ) -> torch.Tensor:
         for layer in layers:
-            # Multi-GPU: move all inputs to this layer's device if needed.
-            # device_map="auto" can split layers across GPUs; manual forward
-            # must handle cross-device moves explicitly.
             dev = self._dev(layer)
             if hidden_states.device != dev:
                 hidden_states  = hidden_states.to(dev)
@@ -160,18 +163,46 @@ class Phase0Model(nn.Module):
                         t.to(dev) if isinstance(t, torch.Tensor) else t
                         for t in position_embeddings
                     )
-            out = layer(
-                hidden_states,
-                attention_mask      = causal_mask,
-                position_ids        = position_ids,
-                past_key_value      = None,
-                output_attentions   = False,
-                use_cache           = False,
-                cache_position      = cache_position,
-                position_embeddings = position_embeddings,
-            )
-            # transformers ≥5.x: returns Tensor; <5.x: returns tuple
-            hidden_states = out[0] if isinstance(out, tuple) else out
+
+            if use_checkpoint and hidden_states.requires_grad:
+                # Capture frozen args in closure; only h flows through checkpoint.
+                # This recomputes the layer's forward during backward, saving
+                # intermediate activation memory at ~2× compute cost.
+                _layer       = layer
+                _mask        = causal_mask
+                _pos_ids     = position_ids
+                _cache_pos   = cache_position
+                _pos_emb     = position_embeddings
+
+                def _ckpt_fn(h, _l=_layer, _m=_mask, _pi=_pos_ids,
+                             _cp=_cache_pos, _pe=_pos_emb):
+                    out = _l(
+                        h,
+                        attention_mask      = _m,
+                        position_ids        = _pi,
+                        past_key_value      = None,
+                        output_attentions   = False,
+                        use_cache           = False,
+                        cache_position      = _cp,
+                        position_embeddings = _pe,
+                    )
+                    return out[0] if isinstance(out, tuple) else out
+
+                hidden_states = torch.utils.checkpoint.checkpoint(
+                    _ckpt_fn, hidden_states, use_reentrant=False,
+                )
+            else:
+                out = layer(
+                    hidden_states,
+                    attention_mask      = causal_mask,
+                    position_ids        = position_ids,
+                    past_key_value      = None,
+                    output_attentions   = False,
+                    use_cache           = False,
+                    cache_position      = cache_position,
+                    position_embeddings = position_embeddings,
+                )
+                hidden_states = out[0] if isinstance(out, tuple) else out
         return hidden_states
 
     # -----------------------------------------------------------------------
@@ -267,14 +298,16 @@ class Phase0Model(nn.Module):
                                              pos_emb, causal_mask, position_ids, cache_position)
             else:
                 h_out = self._run_layers(h, self.loop_layers,
-                                         pos_emb, causal_mask, position_ids, cache_position)
+                                         pos_emb, causal_mask, position_ids, cache_position,
+                                         use_checkpoint=self.cfg.gradient_checkpointing)
 
             # Auxiliary LM loss and consistency loss only matter for gradient-
             # tracked iterations; skip entirely for early (no-grad) iterations.
             if not is_early:
                 if labels is not None and self.cfg.aux_loss_weight > 0.0:
                     h_aux = self._run_layers(h_out, self.suffix_layers,
-                                             pos_emb, causal_mask, position_ids, cache_position)
+                                             pos_emb, causal_mask, position_ids, cache_position,
+                                             use_checkpoint=self.cfg.gradient_checkpointing)
                     h_norm_i = self.norm(h_aux.to(self._dev(self.norm)))
                     logits_i = self.lm_head(h_norm_i.to(self._dev(self.lm_head)))
                     loss_i = nn.CrossEntropyLoss(ignore_index=-100)(
@@ -345,7 +378,8 @@ class Phase0Model(nn.Module):
 
         # 6. Suffix: no torch.no_grad() — gradient must reach connect layer
         h = self._run_layers(h, self.suffix_layers,
-                             pos_emb, causal_mask, position_ids, cache_position)
+                             pos_emb, causal_mask, position_ids, cache_position,
+                             use_checkpoint=self.cfg.gradient_checkpointing)
         h = self.norm(h.to(self._dev(self.norm)))
 
         # 7. LM Head (frozen weights, activations flow grad back to connect)

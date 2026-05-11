@@ -104,6 +104,7 @@ CMD=(
     --k_bptt         2
     --curriculum                    # ramp n_iter 2→3 over training
     --attn_impl      sdpa           # PyTorch built-in SDPA (no extra package)
+    --gradient_checkpointing        # recompute activations → 10-20× less VRAM, ~2× slower bwd
 
     # ── Session management (Kaggle-friendly) ─────────────────────────────────
     --save_every     50             # write resume.pt every 50 steps
