@@ -93,7 +93,7 @@ def parse_args():
                    choices=["instruction", "text", "glm"],
                    help="'instruction': Roman claude; 'glm': GLM reasoning; 'text': plain blocks")
     p.add_argument("--no_think",       action="store_true",
-                   help="Strip <think> reasoning -- train on answer-only")
+                   help="Strip reasoning content while preserving Qwen's empty <think></think> wrapper")
     p.add_argument("--num_workers",    type=int,   default=12,
                    help="DataLoader worker processes (default: 12)")
     p.add_argument("--local_dataset_dir", default="data/glm_dataset",
@@ -158,12 +158,12 @@ def save_checkpoint_meta(path: str, cfg: Phase0Config, args, **extra) -> None:
         )
 
 
-def dataset_diagnostics(dataset, name: str, max_items: int = 256) -> None:
+def dataset_diagnostics(dataset, name: str, max_items: int = 256) -> dict[str, float]:
     """Print cheap label/truncation diagnostics for tokenized datasets."""
     n = min(len(dataset), max_items)
     if n == 0:
         print(f"[data:{name}] empty dataset")
-        return
+        return {}
 
     zero_grad = 0
     assistant_tokens = 0
@@ -187,14 +187,57 @@ def dataset_diagnostics(dataset, name: str, max_items: int = 256) -> None:
         end_think_labels += int((labels == 151668).any().item())
 
     if total_tokens == 0:
-        return
+        return {}
+    stats = {
+        "checked": float(n),
+        "assistant_token_ratio": assistant_tokens / total_tokens,
+        "zero_grad_ratio": zero_grad / n,
+        "likely_truncated_ratio": likely_truncated / n,
+        "end_think_labeled_ratio": end_think_labels / n,
+    }
     print(
         f"[data:{name}] checked={n}  "
-        f"assistant_token_ratio={assistant_tokens/total_tokens:.3f}  "
-        f"zero_grad={zero_grad/n:.3f}  "
-        f"likely_truncated={likely_truncated/n:.3f}  "
-        f"end_think_labeled={end_think_labels/n:.3f}"
+        f"assistant_token_ratio={stats['assistant_token_ratio']:.3f}  "
+        f"zero_grad={stats['zero_grad_ratio']:.3f}  "
+        f"likely_truncated={stats['likely_truncated_ratio']:.3f}  "
+        f"end_think_labeled={stats['end_think_labeled_ratio']:.3f}"
     )
+    return stats
+
+
+def warn_chat_format_risks(args, train_stats: dict[str, float], eval_stats: dict[str, float]) -> None:
+    """Warn about label-format risks that make think/no_think training misleading."""
+    if args.dataset_type == "text":
+        return
+
+    end_ratio = min(
+        train_stats.get("end_think_labeled_ratio", 0.0),
+        eval_stats.get("end_think_labeled_ratio", 0.0),
+    )
+    trunc_ratio = max(
+        train_stats.get("likely_truncated_ratio", 0.0),
+        eval_stats.get("likely_truncated_ratio", 0.0),
+    )
+
+    if args.no_think and end_ratio < 0.9:
+        print(
+            "[warn:data] no_think mode should label Qwen's empty </think> wrapper "
+            f"almost always, but observed min ratio={end_ratio:.3f}. "
+            "Check tokenizer/template compatibility before training."
+        )
+    if not args.no_think and end_ratio < 0.5:
+        print(
+            "[warn:data] thinking mode rarely reaches </think> "
+            f"(min labeled ratio={end_ratio:.3f}). Reasoning traces are likely "
+            f"truncated at seq_len={args.seq_len}; increase --seq_len, use "
+            "--no_think, or filter long reasoning examples."
+        )
+    if trunc_ratio > 0.5:
+        print(
+            "[warn:data] many assistant spans reach the sequence boundary "
+            f"(max likely_truncated={trunc_ratio:.3f}). PPL may be dominated by "
+            "truncated completions; consider larger --seq_len or shorter samples."
+        )
 
 
 @torch.no_grad()
@@ -344,8 +387,9 @@ def main():
     train_ds, eval_ds, test_ds = split_dataset(full_ds)
     print(f"\n[data] Split -> train: {len(train_ds)}  "
           f"eval: {len(eval_ds)}  test: {len(test_ds)}\n")
-    dataset_diagnostics(train_ds, "train")
-    dataset_diagnostics(eval_ds, "eval")
+    train_diag = dataset_diagnostics(train_ds, "train")
+    eval_diag = dataset_diagnostics(eval_ds, "eval")
+    warn_chat_format_risks(args, train_diag, eval_diag)
 
     train_dl = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True, drop_last=True,

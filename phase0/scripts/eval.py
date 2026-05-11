@@ -17,7 +17,7 @@ Chạy:
     python phase0/scripts/eval.py --true_baseline_only
 """
 
-import argparse, sys, os, math
+import argparse, sys, os, math, contextlib
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
 import torch
@@ -170,6 +170,51 @@ def eval_true_baseline(model_name: str, loader, device, dtype, desc: str = "") -
     return _ppl_from_loss(total_loss, total_tok)
 
 
+@contextlib.contextmanager
+def _identity_connect_ctx(model: "Phase0Model"):
+    """
+    Temporarily replace connect.forward with an identity that returns h_out
+    unchanged (i.e., raw loop output passed directly to next iteration, with no
+    learned remapping).  This isolates connect's contribution from the extra
+    compute gained by running the loop block N times.
+    """
+    original_forward = model.connect.forward
+
+    def _identity(*args, **kwargs):
+        return args[0]   # return h_out, ignore h_prev / other args
+
+    model.connect.forward = _identity
+    try:
+        yield
+    finally:
+        model.connect.forward = original_forward
+
+
+@torch.no_grad()
+def eval_ablate_connect(
+    model: "Phase0Model",
+    loader,
+    device,
+    n_iter_list: list[int],
+) -> dict[int, dict]:
+    """
+    For each n_iter, evaluate PPL with trained connect vs identity connect.
+    Returns dict: {n_iter: {"trained": ppl, "identity": ppl, "delta": delta}}
+
+    delta < 0 → trained connect BETTER than identity (connect adds value)
+    delta ≈ 0 → connect adds nothing; improvement is purely from extra compute
+    """
+    results = {}
+    for n in n_iter_list:
+        trained_ppl  = eval_looped_details(model, loader, device, n_iter=n)["ppl"]
+        with _identity_connect_ctx(model):
+            identity_ppl = eval_looped_details(model, loader, device, n_iter=n,
+                                               desc=f"  n_iter={n} [identity]")["ppl"]
+        delta = trained_ppl - identity_ppl
+        results[n] = {"trained": trained_ppl, "identity": identity_ppl, "delta": delta}
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Args
 # ---------------------------------------------------------------------------
@@ -201,6 +246,12 @@ def parse_args():
                    help="Bỏ qua true baseline eval (nếu đã biết rồi)")
     p.add_argument("--logit_kl",           action="store_true",
                    help="Also compute KL(logits_n0 || logits_n) for n>=2. Costs extra VRAM/time.")
+    p.add_argument("--ablate_connect",     action="store_true",
+                   help="Compare trained connect vs identity connect per n_iter. "
+                        "Isolates connect layer contribution from raw extra-compute gain.")
+    p.add_argument("--ablate_iters",       type=str, default=None,
+                   help="Comma-separated n_iter values to ablate, e.g. '2,3'. "
+                        "Defaults to all iters from 2..max_iter.")
     p.add_argument("--dtype",              default="bfloat16",
                    choices=["float32", "bfloat16", "float16"])
     return p.parse_args()
@@ -316,7 +367,27 @@ def main():
             kl = eval_logit_kl_vs_n0(model, loader, device, n_iter=n)
             kl_results[n] = kl
             extra += f"  KL(n0||n{n})={kl:.5f}"
-        print(f"    n_iter={n}  PPL={ppl:.2f}{extra}")
+        note = "  (no connect — single loop pass = baseline)" if n == 1 else ""
+        print(f"    n_iter={n}  PPL={ppl:.2f}{extra}{note}")
+
+    # ── 4. Connect ablation ───────────────────────────────────────────
+    ablate_results = {}
+    if args.ablate_connect:
+        if args.ablate_iters:
+            ablate_ns = [int(x) for x in args.ablate_iters.split(",")]
+        else:
+            ablate_ns = list(range(2, args.max_iter + 1))
+        print(f"\n[4] Connect ablation — trained vs identity (n_iter={ablate_ns})")
+        print("    identity = pass h_out directly; no learned remapping")
+        print("    delta<0 → connect BETTER than raw chaining")
+        ablate_results = eval_ablate_connect(model, loader, device, ablate_ns)
+        for n, res in ablate_results.items():
+            sign = "✅ connect helps" if res["delta"] < -0.05 else (
+                   "⚠️  marginal"    if res["delta"] < 0.05 else
+                   "❌ connect hurts / no effect")
+            print(f"    n_iter={n}  trained={res['trained']:.2f}  "
+                  f"identity={res['identity']:.2f}  "
+                  f"Δ={res['delta']:+.2f}  {sign}")
 
     # ── Summary ──────────────────────────────────────────────────────
     print("\n" + "─" * 65)
@@ -361,6 +432,18 @@ def main():
         print(f"  ⚠️  Loop is close but not better than {ref_label}. Train more.")
     else:
         print(f"  ❌ Loop still worse than {ref_label}. Connect layer needs more training.")
+
+    if ablate_results:
+        print()
+        helps = [n for n, r in ablate_results.items() if r["delta"] < -0.05]
+        neutral = [n for n, r in ablate_results.items() if -0.05 <= r["delta"] <= 0.05]
+        hurts = [n for n, r in ablate_results.items() if r["delta"] > 0.05]
+        if helps:
+            print(f"  ✅ Connect layer HELPS at n_iter={helps} — loop learns beyond raw compute")
+        if neutral:
+            print(f"  ⚠️  Connect layer NEUTRAL at n_iter={neutral} — improvement = extra compute only")
+        if hurts:
+            print(f"  ❌ Connect layer HURTS at n_iter={hurts} — may need retraining")
 
     print("=" * 65)
 

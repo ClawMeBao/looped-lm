@@ -85,8 +85,12 @@ class Phase0Model(nn.Module):
     """
     Phase 0: Frozen backbone + trainable connect layer.
 
-    n_iter=0/1 → true baseline: run all layers once, no connect.
-    n_iter>=2   → prefix → loop → (connect → loop) × (n_iter-1) → suffix.
+    n_iter=0  → TRUE BASELINE: run all 28 layers once, identical to HF model.
+    n_iter=1  → single loop pass via loop code path (no connect called, PPL = baseline).
+    n_iter>=2 → prefix → loop → (connect → loop) × (n_iter-1) → suffix.
+
+    Note: n_iter=1 and n_iter=0 produce identical output (both = 28 layers, no connect).
+    n_iter=1 is kept for completeness but is semantically equivalent to baseline.
 
     Trainable params: connect layer only (~2M MLP / ~6M Gated).
     """
@@ -190,9 +194,12 @@ class Phase0Model(nn.Module):
 
         # ── Bug5 fix ──────────────────────────────────────────────────────
         # n_iter=0: TRUE BASELINE — run all 28 layers, identical to HF model.
-        # Previous code skipped the loop block entirely, producing PPL ~10k
-        # on a mutilated 16-layer forward pass.
-        if self.cfg.n_iter <= 1:
+        # Previous code treated n_iter<=1 as baseline, incorrectly bundling
+        # n_iter=1 (single loop pass) with n_iter=0. Now only n_iter=0 takes
+        # the fast baseline path; n_iter=1 falls through to the loop code below,
+        # producing identical PPL (1 loop pass, no connect called) but correctly
+        # reflecting that it runs via the loop architecture.
+        if self.cfg.n_iter == 0:
             self._last_connect_metrics = {}
             with torch.no_grad():
                 h = self._run_layers(h, self.prefix_layers,
