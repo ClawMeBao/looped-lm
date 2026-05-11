@@ -94,6 +94,11 @@ def parse_args():
                    help="'instruction': Roman claude; 'glm': GLM reasoning; 'text': plain blocks")
     p.add_argument("--no_think",       action="store_true",
                    help="Strip reasoning content while preserving Qwen's empty <think></think> wrapper")
+    p.add_argument("--filter_think_len", type=int, default=None,
+                   help="Skip examples whose <think>…</think> block exceeds this many characters. "
+                        "Auto-computed when --no_think is False and this is unset: "
+                        "(seq_len - 200) * 3.5 (keeps ~58%% of GLM at seq_len=2048). "
+                        "Set to 0 to disable filtering entirely.")
     p.add_argument("--num_workers",    type=int,   default=12,
                    help="DataLoader worker processes (default: 12)")
     p.add_argument("--local_dataset_dir", default="data/glm_dataset",
@@ -329,6 +334,35 @@ def main():
     dtype   = {"float32": torch.float32, "bfloat16": torch.bfloat16,
                "float16": torch.float16}[args.dtype]
 
+    # -- Pre-flight validation: thinking mode requires large seq_len ----------
+    if args.dataset_type != "text" and not args.no_think:
+        if args.seq_len < 1024:
+            raise ValueError(
+                f"Thinking mode requires --seq_len >= 1024 (got {args.seq_len}). "
+                "GLM thinking chains: p50≈1675 tokens, p90≈5514 tokens. "
+                "Only 9.4% of chains fit at seq_len=512. "
+                "Recommended: --seq_len 2048 (fits 58%) or --seq_len 4096 (fits 86%). "
+                "To train without thinking, add --no_think."
+            )
+        if args.seq_len < 2048:
+            print(
+                f"[warn:think] seq_len={args.seq_len} is marginal for thinking mode. "
+                "Only ~20% of GLM thinking chains fit. "
+                "Recommend --seq_len 2048 (58% fit) or --seq_len 4096 (86% fit)."
+            )
+
+    # -- Auto-compute max_think_chars ----------------------------------------
+    # When thinking mode and no explicit filter: auto-set to (seq_len - 200) * 3.5
+    # so that examples fitting the budget pass; truncated-dominant ones are skipped.
+    if args.dataset_type != "text" and not args.no_think:
+        if args.filter_think_len is None:
+            args.filter_think_len = int((args.seq_len - 200) * 3.5)
+            print(f"[data] Auto filter_think_len={args.filter_think_len} chars "
+                  f"(seq_len={args.seq_len}). Override with --filter_think_len N or "
+                  "--filter_think_len 0 to disable.")
+        elif args.filter_think_len == 0:
+            args.filter_think_len = None  # 0 means disable
+
     print("=" * 60)
     print("  Phase 0 -- Connect Layer Training")
     print("=" * 60)
@@ -358,11 +392,12 @@ def main():
     if args.dataset_type == "instruction":
         full_ds = load_instruction_dataset(
             tokenizer,
-            dataset_name = args.dataset,
-            split        = "train",
-            max_length   = args.seq_len,
-            max_samples  = args.max_samples,
-            no_think     = args.no_think,
+            dataset_name    = args.dataset,
+            split           = "train",
+            max_length      = args.seq_len,
+            max_samples     = args.max_samples,
+            no_think        = args.no_think,
+            max_think_chars = args.filter_think_len,
         )
     elif args.dataset_type == "glm":
         glm_name = (args.dataset
@@ -376,6 +411,7 @@ def main():
             max_samples      = args.max_samples,
             no_think         = args.no_think,
             local_dir        = args.local_dataset_dir,
+            max_think_chars  = args.filter_think_len,
         )
     else:
         full_ds = load_text_dataset(

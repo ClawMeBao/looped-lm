@@ -171,6 +171,7 @@ def _build_chat_example(
     messages: list[dict],
     max_length: int,
     no_think: bool = False,
+    max_think_chars: Optional[int] = None,
 ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
     """
     Tokenize một conversation với label mask: loss chỉ tính trên assistant tokens.
@@ -181,13 +182,27 @@ def _build_chat_example(
     no_think=True: strip real <think>…</think> reasoning from assistant content before
     rendering the template, but still supervise the template's empty think wrapper.
 
+    max_think_chars: if set and no_think=False, skip examples where any assistant
+    <think>…</think> block exceeds this character count.  This is the primary knob
+    to prevent short seq_len training from being dominated by truncated reasoning.
+    Rule of thumb: set to roughly (seq_len - 200) * 3.5 to keep thinking within budget.
+
     Returns (input_ids, labels) tensors or None nếu không có assistant token.
     """
-    # Note: enable_thinking=False does NOT suppress <think> tokens in Qwen3.
-    # The template still injects an empty <think>...</think> wrapper. In no_think
-    # mode we remove reasoning text from the content, but we keep wrapper tokens
-    # in the labels so the looped model learns the same response protocol as the
-    # base model: <think>\n</think>\n\nanswer.
+    # Pre-filter: skip examples whose thinking chain exceeds the budget.
+    if max_think_chars is not None and not no_think:
+        for m in messages:
+            if m.get("role") == "assistant":
+                content = m.get("content", "") or ""
+                match = re.search(r"<think>(.*?)</think>", content, re.DOTALL)
+                if match and len(match.group(1)) > max_think_chars:
+                    return None
+    # Qwen3 chat template ALWAYS injects an empty <think>\n\n</think>\n\n wrapper
+    # before the answer, regardless of enable_thinking.  `enable_thinking` only
+    # affects the *generation prompt* suffix (used at inference, not here).
+    # In no_think mode we strip reasoning text from assistant content, keeping the
+    # empty wrapper so the model learns: <think>\n\n</think>\n\nanswer.
+    # In think mode the full <think>REASONING</think>\n\nANSWER is preserved.
     template_kwargs: dict = {}
 
     # Normalise messages: strip unknown fields, inject reasoning or strip think
@@ -275,11 +290,13 @@ class ChatDataset(Dataset):
         messages_list: list[list[dict]],
         max_length: int = 512,
         no_think: bool = False,
+        max_think_chars: Optional[int] = None,
     ):
-        self.tokenizer    = tokenizer
-        self.max_length   = max_length
-        self.no_think     = no_think
-        self.pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id or 0
+        self.tokenizer      = tokenizer
+        self.max_length     = max_length
+        self.no_think       = no_think
+        self.max_think_chars = max_think_chars
+        self.pad_token_id   = tokenizer.pad_token_id or tokenizer.eos_token_id or 0
 
         # Cheap pre-filter: keep only conversations with at least one assistant turn.
         # Full validity is checked lazily in __getitem__.
@@ -303,7 +320,8 @@ class ChatDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict:
         result = _build_chat_example(
-            self.tokenizer, self.messages_list[idx], self.max_length, no_think=self.no_think
+            self.tokenizer, self.messages_list[idx], self.max_length,
+            no_think=self.no_think, max_think_chars=self.max_think_chars,
         )
         if result is None:
             # Edge case: assistant tokens all truncated — return all-pad sample
@@ -332,6 +350,7 @@ def load_instruction_dataset(
     max_length: int = 512,
     max_samples: Optional[int] = None,
     no_think: bool = False,
+    max_think_chars: Optional[int] = None,
 ) -> Dataset:
     """
     Load instruction-following dataset và build ChatDataset với chat template.
@@ -344,6 +363,9 @@ def load_instruction_dataset(
 
     no_think=True: strip reasoning content but keep the empty Qwen think wrapper
     in labels so inference preserves `<think>...</think>` response structure.
+
+    max_think_chars: skip examples whose thinking chain exceeds this many characters
+    (only active when no_think=False).  Rule of thumb: (seq_len - 200) * 3.5.
     """
     from datasets import load_dataset
 
@@ -355,7 +377,8 @@ def load_instruction_dataset(
 
     think_tag = " [no_think]" if no_think else " [think]"
     print(f"[data] Loaded {dataset_name} ({split}){think_tag}: {len(messages_list)} conversations")
-    dataset = ChatDataset(tokenizer, messages_list, max_length=max_length, no_think=no_think)
+    dataset = ChatDataset(tokenizer, messages_list, max_length=max_length, no_think=no_think,
+                          max_think_chars=max_think_chars)
     print(f"[data] ChatDataset: {len(dataset)} valid examples × {max_length} tokens")
     return dataset
 
@@ -368,6 +391,7 @@ def load_glm_dataset(
     max_samples: Optional[int] = None,
     no_think: bool = False,
     local_dir: str = "data/glm_dataset",
+    max_think_chars: Optional[int] = None,
 ) -> Dataset:
     """
     Load GLM-5.1 reasoning dataset (ShareGPT format) và build ChatDataset.
@@ -384,6 +408,10 @@ def load_glm_dataset(
 
     no_think=True: strip <think>...</think> reasoning from gpt responses, while
     still supervising the empty Qwen think wrapper produced by the chat template.
+
+    max_think_chars: skip examples whose thinking chain exceeds this many characters
+    (only active when no_think=False).  GLM chains: p50≈5.9k, p90≈19k chars.
+    Rule of thumb: (seq_len - 200) * 3.5 keeps ~58% examples at seq_len=2048.
     """
     import os
     from datasets import load_dataset, load_from_disk
@@ -419,6 +447,7 @@ def load_glm_dataset(
 
     think_tag = " [no_think]" if no_think else " [think]"
     print(f"[data] Loaded {dataset_name} ({split}){think_tag}: {len(messages_list)} conversations")
-    dataset = ChatDataset(tokenizer, messages_list, max_length=max_length, no_think=no_think)
+    dataset = ChatDataset(tokenizer, messages_list, max_length=max_length, no_think=no_think,
+                          max_think_chars=max_think_chars)
     print(f"[data] ChatDataset: {len(dataset)} valid examples × {max_length} tokens")
     return dataset
