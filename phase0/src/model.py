@@ -146,6 +146,20 @@ class Phase0Model(nn.Module):
         cache_position:      torch.Tensor,
     ) -> torch.Tensor:
         for layer in layers:
+            # Multi-GPU: move all inputs to this layer's device if needed.
+            # device_map="auto" can split layers across GPUs; manual forward
+            # must handle cross-device moves explicitly.
+            dev = self._dev(layer)
+            if hidden_states.device != dev:
+                hidden_states  = hidden_states.to(dev)
+                causal_mask    = causal_mask.to(dev)
+                position_ids   = position_ids.to(dev)
+                cache_position = cache_position.to(dev)
+                if isinstance(position_embeddings, (tuple, list)):
+                    position_embeddings = tuple(
+                        t.to(dev) if isinstance(t, torch.Tensor) else t
+                        for t in position_embeddings
+                    )
             out = layer(
                 hidden_states,
                 attention_mask      = causal_mask,
@@ -173,24 +187,26 @@ class Phase0Model(nn.Module):
         device = input_ids.device
         B, S   = input_ids.shape
 
-        # 1. Embed
-        h = self.embed_tokens(input_ids)                    # [B, S, d]
+        # 1. Embed — move input_ids to embed_tokens' device (may differ in multi-GPU)
+        embed_dev = self._dev(self.embed_tokens)
+        h = self.embed_tokens(input_ids.to(embed_dev))     # [B, S, d]
 
         # 2. Position ids + RoPE
-        position_ids   = torch.arange(S, device=device).unsqueeze(0).expand(B, -1).contiguous()
-        cache_position = torch.arange(S, device=device)
+        position_ids   = torch.arange(S, device=h.device).unsqueeze(0).expand(B, -1).contiguous()
+        cache_position = torch.arange(S, device=h.device)
 
+        rotary_dev = self._dev(self.rotary_emb)
         if self._rotary_uses_position_ids:
-            pos_emb = self.rotary_emb(h, position_ids)
+            pos_emb = self.rotary_emb(h.to(rotary_dev), position_ids.to(rotary_dev))
         else:
-            pos_emb = self.rotary_emb(h, seq_len=S)
+            pos_emb = self.rotary_emb(h.to(rotary_dev), seq_len=S)
 
-        # 3. Causal mask [B, 1, S, S]
-        causal_mask = self._make_causal_mask(B, S, device, h.dtype)
+        # 3. Causal mask [B, 1, S, S] — created on h's device; _run_layers moves per-layer
+        causal_mask = self._make_causal_mask(B, S, h.device, h.dtype)
         if attention_mask is not None:
             pad = (1.0 - attention_mask[:, None, None, :].to(h.dtype)) \
                   * torch.finfo(h.dtype).min
-            causal_mask = causal_mask + pad
+            causal_mask = causal_mask + pad.to(causal_mask.device)
 
         # ── Bug5 fix ──────────────────────────────────────────────────────
         # n_iter=0: TRUE BASELINE — run all 28 layers, identical to HF model.
@@ -208,14 +224,14 @@ class Phase0Model(nn.Module):
                                      pos_emb, causal_mask, position_ids, cache_position)
                 h = self._run_layers(h, self.suffix_layers,
                                      pos_emb, causal_mask, position_ids, cache_position)
-                h = self.norm(h)
-            logits = self.lm_head(h)
+                h = self.norm(h.to(self._dev(self.norm)))
+            logits = self.lm_head(h.to(self._dev(self.lm_head)))
 
             loss = None
             if labels is not None:
                 loss = nn.CrossEntropyLoss(ignore_index=-100)(
                     logits[..., :-1, :].contiguous().view(-1, logits.size(-1)),
-                    labels[..., 1:].contiguous().view(-1),
+                    labels[..., 1:].contiguous().view(-1).to(logits.device),
                 )
                 self._last_loss_metrics = {"lm_loss": float(loss.detach().item())}
             return CausalLMOutputWithPast(loss=loss, logits=logits)
@@ -256,11 +272,11 @@ class Phase0Model(nn.Module):
             if labels is not None and self.cfg.aux_loss_weight > 0.0:
                 h_aux = self._run_layers(h_out, self.suffix_layers,
                                          pos_emb, causal_mask, position_ids, cache_position)
-                h_norm_i = self.norm(h_aux)
-                logits_i = self.lm_head(h_norm_i)
+                h_norm_i = self.norm(h_aux.to(self._dev(self.norm)))
+                logits_i = self.lm_head(h_norm_i.to(self._dev(self.lm_head)))
                 loss_i = nn.CrossEntropyLoss(ignore_index=-100)(
                     logits_i[..., :-1, :].contiguous().view(-1, logits_i.size(-1)),
-                    labels[..., 1:].contiguous().view(-1),
+                    labels[..., 1:].contiguous().view(-1).to(logits_i.device),
                 )
                 aux_losses.append(loss_i)
 
@@ -282,14 +298,18 @@ class Phase0Model(nn.Module):
                 h = h_out
             else:
                 # Connect layer (trainable): layer loop_end -> layer loop_start
+                # Move to connect's device before calling (multi-GPU safe)
+                connect_dev = self._dev(self.connect)
+                h_out_c  = h_out.to(connect_dev)
+                h_prev_c = h_prev.to(connect_dev)
                 if isinstance(self.connect, IterationAwareConnectLayer):
-                    h_next = self.connect(h_out, h_prev, step_idx=i)
+                    h_next = self.connect(h_out_c, h_prev_c, step_idx=i)
                 elif isinstance(self.connect, ResidualConnectLayer):
-                    h_next = self.connect(h_out, h_prev)
+                    h_next = self.connect(h_out_c, h_prev_c)
                 elif isinstance(self.connect, GatedResidualConnectLayer):
-                    h_next = self.connect(h_out, h_prev)
+                    h_next = self.connect(h_out_c, h_prev_c)
                 else:
-                    h_next = self.connect(h_out, h_prev)
+                    h_next = self.connect(h_out_c, h_prev_c)
 
                 # Cheap diagnostics: if update_norm_ratio is near 0, the
                 # connect layer is effectively a no-op and extra loop compute
@@ -327,17 +347,17 @@ class Phase0Model(nn.Module):
         # 6. Suffix: no torch.no_grad() — gradient must reach connect layer
         h = self._run_layers(h, self.suffix_layers,
                              pos_emb, causal_mask, position_ids, cache_position)
-        h = self.norm(h)
+        h = self.norm(h.to(self._dev(self.norm)))
 
         # 7. LM Head (frozen weights, activations flow grad back to connect)
-        logits = self.lm_head(h)                            # [B, S, vocab]
+        logits = self.lm_head(h.to(self._dev(self.lm_head)))    # [B, S, vocab]
 
         # 8. Loss
         loss = None
         if labels is not None:
             lm_loss = nn.CrossEntropyLoss(ignore_index=-100)(
                 logits[..., :-1, :].contiguous().view(-1, logits.size(-1)),
-                labels[..., 1:].contiguous().view(-1),
+                labels[..., 1:].contiguous().view(-1).to(logits.device),
             )
             loss = lm_loss
             aux_total = None
@@ -384,6 +404,16 @@ class Phase0Model(nn.Module):
         mask = torch.full((S, S), torch.finfo(dtype).min, device=device, dtype=dtype)
         mask = torch.triu(mask, diagonal=1)
         return mask[None, None].expand(B, 1, S, S).contiguous()
+
+    @staticmethod
+    def _dev(module: nn.Module) -> torch.device:
+        """Return device of the first parameter or buffer in a module."""
+        for p in module.parameters():
+            return p.device
+        for b in module.buffers():
+            return b.device
+        # Fallback: module has no params (e.g. identity) — return CPU
+        return torch.device("cpu")
 
     def train(self, mode: bool = True):
         """
