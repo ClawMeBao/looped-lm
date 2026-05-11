@@ -37,7 +37,7 @@ DATASET_CACHE="${DATASET_CACHE:-${REPO_ROOT}/data/glm_dataset}"
 
 # Per-session step budget. Tune to fit within Kaggle's 9-hour window.
 # At seq_len=2048, batch=2 on T4×2: ~1.5–2 s/step → 1000 steps ≈ 30–40 min.
-EXTRA_STEPS="${EXTRA_STEPS:-1000}"
+EXTRA_STEPS="${EXTRA_STEPS:-2000}"
 
 # Known baseline PPL from a previous run; set to skip re-evaluation.
 # Leave empty ("") to run baseline eval (adds ~10 min per session).
@@ -92,7 +92,7 @@ CMD=(
 
     # ── Training ─────────────────────────────────────────────────────────────
     --dtype          float16        # T4 (SM 7.5) has no native BF16 hardware
-    --batch_size     2
+    --batch_size     4
     --lr             5e-5
     --warmup_ratio   0.05
     --grad_clip      1.0
