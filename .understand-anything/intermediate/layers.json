@@ -1,0 +1,73 @@
+[
+  {
+    "id": "layer:shared-library",
+    "name": "Shared Library",
+    "description": "Frozen Qwen3 backbone loading, trainable connect layer implementations (MLP and GatedResidual), and dataset utilities shared by all phases",
+    "nodeIds": [
+      "file:common/__init__.py",
+      "file:common/backbone.py",
+      "file:common/connect_layer.py",
+      "file:common/data_utils.py",
+      "file:common/download_dataset.py"
+    ]
+  },
+  {
+    "id": "layer:phase0-model",
+    "name": "Phase 0 Model",
+    "description": "Phase 0 looped LM implementation with fixed n_iter, Phase0Config, and connect layer checkpoint save/load",
+    "nodeIds": [
+      "file:phase0/__init__.py",
+      "file:phase0/src/__init__.py",
+      "file:phase0/src/model.py"
+    ]
+  },
+  {
+    "id": "layer:phase0-scripts",
+    "name": "Phase 0 Scripts & Tests",
+    "description": "Phase 0 training loop (truncated BPTT, curriculum), perplexity eval, text inference, generation comparison, and forward-pass smoke tests",
+    "nodeIds": [
+      "file:phase0/scripts/__init__.py",
+      "file:phase0/scripts/train.py",
+      "file:phase0/scripts/eval.py",
+      "file:phase0/scripts/inference.py",
+      "file:phase0/scripts/test_forward.py",
+      "file:phase0/scripts/compare_generation.py",
+      "file:phase0/tests/__init__.py"
+    ]
+  },
+  {
+    "id": "layer:phase1",
+    "name": "Phase 1 — Dynamic Exit Gate",
+    "description": "Phase 1 model with soft/hard ExitGate for dynamic loop termination, ponder and consistency loss training, and warm-start from Phase 0 checkpoint",
+    "nodeIds": [
+      "file:phase1/__init__.py",
+      "file:phase1/src/__init__.py",
+      "file:phase1/src/exit_gate.py",
+      "file:phase1/src/model.py",
+      "file:phase1/scripts/__init__.py",
+      "file:phase1/scripts/train.py"
+    ]
+  },
+  {
+    "id": "layer:phase2",
+    "name": "Phase 2 — Planned Extensions",
+    "description": "Phase 2 stubs for iteration-aware connect, linear-attention state carry, and LoRA unfreeze — not yet implemented",
+    "nodeIds": [
+      "file:phase2/__init__.py",
+      "file:phase2/src/__init__.py",
+      "file:phase2/src/model.py",
+      "file:phase2/scripts/__init__.py"
+    ]
+  },
+  {
+    "id": "layer:project-support",
+    "name": "Project Support",
+    "description": "Project documentation (README, architecture design, Phase 0 experimental report) and Python dependency specification",
+    "nodeIds": [
+      "document:README.md",
+      "document:docs/design.md",
+      "document:docs/PHASE0_REPORT.md",
+      "config:requirements.txt"
+    ]
+  }
+]

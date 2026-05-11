@@ -106,7 +106,7 @@ CMD=(
     # ── Eval ─────────────────────────────────────────────────────────────────
     --eval_steps     200
     --eval_max_batches 50           # fast mid-run eval (~50 batches)
-
+    --skip_baseline_eval         # skip baseline eval if PPL already known (saves ~10 min/session)
     # ── Logging ──────────────────────────────────────────────────────────────
     --log_steps      10
     --num_workers    2              # Kaggle CPU is limited

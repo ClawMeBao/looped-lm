@@ -1,0 +1,233 @@
+{
+  "scriptCompleted": true,
+  "directoryGroups": {
+    "common": [
+      "file:common/__init__.py",
+      "file:common/backbone.py",
+      "file:common/connect_layer.py",
+      "file:common/data_utils.py",
+      "file:common/download_dataset.py"
+    ],
+    "phase0": [
+      "file:phase0/__init__.py",
+      "file:phase0/src/__init__.py",
+      "file:phase0/src/model.py",
+      "file:phase0/scripts/__init__.py",
+      "file:phase0/scripts/train.py",
+      "file:phase0/scripts/eval.py",
+      "file:phase0/scripts/inference.py",
+      "file:phase0/scripts/test_forward.py",
+      "file:phase0/scripts/compare_generation.py",
+      "file:phase0/tests/__init__.py"
+    ],
+    "phase1": [
+      "file:phase1/__init__.py",
+      "file:phase1/src/__init__.py",
+      "file:phase1/src/exit_gate.py",
+      "file:phase1/src/model.py",
+      "file:phase1/scripts/__init__.py",
+      "file:phase1/scripts/train.py"
+    ],
+    "phase2": [
+      "file:phase2/__init__.py",
+      "file:phase2/src/__init__.py",
+      "file:phase2/src/model.py",
+      "file:phase2/scripts/__init__.py"
+    ],
+    "root": [
+      "document:README.md",
+      "config:requirements.txt"
+    ],
+    "docs": [
+      "document:docs/design.md",
+      "document:docs/PHASE0_REPORT.md"
+    ]
+  },
+  "nodeTypeGroups": {
+    "file": [
+      "file:common/__init__.py",
+      "file:common/backbone.py",
+      "file:common/connect_layer.py",
+      "file:common/data_utils.py",
+      "file:common/download_dataset.py",
+      "file:phase0/__init__.py",
+      "file:phase0/src/__init__.py",
+      "file:phase0/src/model.py",
+      "file:phase0/scripts/__init__.py",
+      "file:phase0/scripts/train.py",
+      "file:phase0/scripts/eval.py",
+      "file:phase0/scripts/inference.py",
+      "file:phase0/scripts/test_forward.py",
+      "file:phase0/scripts/compare_generation.py",
+      "file:phase0/tests/__init__.py",
+      "file:phase1/__init__.py",
+      "file:phase1/src/__init__.py",
+      "file:phase1/src/exit_gate.py",
+      "file:phase1/src/model.py",
+      "file:phase1/scripts/__init__.py",
+      "file:phase1/scripts/train.py",
+      "file:phase2/__init__.py",
+      "file:phase2/src/__init__.py",
+      "file:phase2/src/model.py",
+      "file:phase2/scripts/__init__.py"
+    ],
+    "document": [
+      "document:README.md",
+      "document:docs/design.md",
+      "document:docs/PHASE0_REPORT.md"
+    ],
+    "config": [
+      "config:requirements.txt"
+    ]
+  },
+  "crossCategoryEdges": [
+    {
+      "fromType": "file",
+      "toType": "file",
+      "edgeType": "imports",
+      "count": 19
+    },
+    {
+      "fromType": "config",
+      "toType": "file",
+      "edgeType": "configures",
+      "count": 1
+    },
+    {
+      "fromType": "document",
+      "toType": "file",
+      "edgeType": "documents",
+      "count": 3
+    }
+  ],
+  "interGroupImports": [
+    {
+      "from": "phase0",
+      "to": "common",
+      "count": 4
+    },
+    {
+      "from": "phase1",
+      "to": "common",
+      "count": 2
+    }
+  ],
+  "intraGroupDensity": {
+    "common": {
+      "internalEdges": 3,
+      "totalEdges": 9,
+      "density": 0.3333333333333333
+    },
+    "phase0": {
+      "internalEdges": 7,
+      "totalEdges": 11,
+      "density": 0.6363636363636364
+    },
+    "phase1": {
+      "internalEdges": 3,
+      "totalEdges": 5,
+      "density": 0.6
+    },
+    "phase2": {
+      "internalEdges": 0,
+      "totalEdges": 0,
+      "density": 0
+    },
+    "root": {
+      "internalEdges": 0,
+      "totalEdges": 0,
+      "density": 0
+    },
+    "docs": {
+      "internalEdges": 0,
+      "totalEdges": 0,
+      "density": 0
+    }
+  },
+  "patternMatches": {
+    "common": "utility",
+    "phase0": "service",
+    "phase1": "service",
+    "phase2": "service",
+    "root": "config",
+    "docs": "documentation"
+  },
+  "deploymentTopology": {
+    "hasDockerfile": false,
+    "hasCompose": false,
+    "hasK8s": false,
+    "hasTerraform": false,
+    "hasCI": false,
+    "infraFiles": []
+  },
+  "dataPipeline": {
+    "schemaFiles": [],
+    "migrationFiles": [],
+    "dataModelFiles": [
+      "common/data_utils.py",
+      "common/download_dataset.py"
+    ],
+    "apiHandlerFiles": [
+      "phase0/scripts/inference.py"
+    ]
+  },
+  "docCoverage": {
+    "groupsWithDocs": 2,
+    "totalGroups": 6,
+    "coverageRatio": 0.3333333333333333,
+    "undocumentedGroups": [
+      "common",
+      "phase0",
+      "phase1",
+      "phase2"
+    ]
+  },
+  "dependencyDirection": [
+    {
+      "dependent": "phase0",
+      "dependsOn": "common"
+    },
+    {
+      "dependent": "phase1",
+      "dependsOn": "common"
+    }
+  ],
+  "fileStats": {
+    "totalFileNodes": 29,
+    "filesPerGroup": {
+      "common": 5,
+      "phase0": 10,
+      "phase1": 6,
+      "phase2": 4,
+      "root": 2,
+      "docs": 2
+    },
+    "nodeTypeCounts": {
+      "file": 25,
+      "document": 3,
+      "config": 1
+    }
+  },
+  "fileFanIn": {
+    "file:phase0/src/__init__.py": 5,
+    "file:common/backbone.py": 3,
+    "file:common/connect_layer.py": 3,
+    "file:common/data_utils.py": 3,
+    "file:phase1/src/exit_gate.py": 2,
+    "file:phase0/src/model.py": 1,
+    "file:phase0/scripts/inference.py": 1,
+    "file:phase1/src/model.py": 1
+  },
+  "fileFanOut": {
+    "file:common/__init__.py": 3,
+    "file:phase1/src/model.py": 3,
+    "file:phase0/src/model.py": 2,
+    "file:phase0/scripts/train.py": 2,
+    "file:phase0/scripts/eval.py": 2,
+    "file:phase0/scripts/compare_generation.py": 2,
+    "file:phase1/src/__init__.py": 2,
+    "file:phase0/src/__init__.py": 1,
+    "file:phase0/scripts/inference.py": 1,
+    "file:phase0/scripts/test_forward.py": 1
+  }
+}
