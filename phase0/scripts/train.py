@@ -55,7 +55,9 @@ def parse_args():
     p.add_argument("--eval_steps",     type=int,   default=250,
                    help="Run eval split every N optimizer steps (0=disabled)")
     p.add_argument("--eval_max_batches", type=int, default=None,
-                   help="Limit eval batches for quick smoke runs (default: full eval split)")
+                   help="[Deprecated] Use --max_eval_batches instead.")
+    p.add_argument("--max_eval_batches", type=int, default=500,
+                   help="Cap eval DataLoader to this many batches. Default: 500. Set 0 for full eval.")
     p.add_argument("--no_eval_all_iters", action="store_true",
                    help="Only eval target n_iter instead of n_iter=0..N")
     p.add_argument("--log_steps",      type=int,   default=20,
@@ -363,6 +365,12 @@ def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
+    # Merge deprecated --eval_max_batches into --max_eval_batches
+    if args.eval_max_batches is not None and args.max_eval_batches == 500:
+        args.max_eval_batches = args.eval_max_batches
+    if args.max_eval_batches == 0:
+        args.max_eval_batches = None   # 0 → full eval
+
     # Auto-detect resume checkpoint when --resume is not explicitly provided
     if not args.resume:  # None or empty string both suppress
         auto_resume = os.path.join(args.output_dir, "resume.pt")
@@ -482,6 +490,18 @@ def main():
         num_workers=args.num_workers, pin_memory=True,
         persistent_workers=(args.num_workers > 0),
     )
+    # Cap eval to max_eval_batches steps to keep eval fast.
+    # Overrides --eval_max_batches if set to a smaller value.
+    _eval_cap = args.max_eval_batches
+    if _eval_cap is not None and _eval_cap < len(eval_dl):
+        from torch.utils.data import Subset
+        eval_ds  = Subset(eval_ds, list(range(_eval_cap * args.batch_size)))
+        eval_dl  = DataLoader(
+            eval_ds, batch_size=args.batch_size, shuffle=False,
+            num_workers=args.num_workers, pin_memory=True,
+            persistent_workers=(args.num_workers > 0),
+        )
+        print(f"[data] Eval capped to {_eval_cap} batches ({len(eval_ds)} samples)")
     test_dl  = DataLoader(
         test_ds, batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, pin_memory=True,
