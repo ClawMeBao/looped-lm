@@ -686,25 +686,7 @@ def main():
                 log_cnt = 0
                 log_start = time.perf_counter()
 
-            if args.eval_steps > 0 and global_step % args.eval_steps == 0:
-                torch.cuda.empty_cache()
-                eval_loss, ppl = eval_suite(model, eval_dl, device, args,
-                                            baseline_ppl, writer, global_step)
-                sign = "+" if ppl - baseline_ppl >= 0 else ""
-                print(f"  [Eval step {global_step}] loss={eval_loss:.4f}  PPL={ppl:.2f}  "
-                      f"({sign}{ppl-baseline_ppl:.2f} vs baseline={baseline_ppl:.2f})")
-
-                if ppl < best_ppl:
-                    best_ppl = ppl
-                    ckpt = os.path.join(args.output_dir, "best_connect.pt")
-                    model.save_connect(ckpt)
-                    save_checkpoint_meta(ckpt, cfg, args, epoch=epoch,
-                                         global_step=global_step, eval_ppl=ppl)
-                    print(f"  Best saved: {ckpt}")
-
-                model.train()
-                model.connect.train()
-
+            # Save BEFORE eval — ensures checkpoint is written even if eval OOMs.
             if args.save_every > 0 and global_step % args.save_every == 0:
                 resume_ckpt = os.path.join(args.output_dir, "resume.pt")
                 tmp_ckpt    = resume_ckpt + ".tmp"
@@ -723,6 +705,29 @@ def main():
                 )
                 os.replace(tmp_ckpt, resume_ckpt)  # atomic overwrite
                 print(f"  [ckpt] Resume checkpoint → {resume_ckpt}  (step {global_step})")
+
+            if args.eval_steps > 0 and global_step % args.eval_steps == 0:
+                try:
+                    torch.cuda.empty_cache()
+                    eval_loss, ppl = eval_suite(model, eval_dl, device, args,
+                                                baseline_ppl, writer, global_step)
+                    sign = "+" if ppl - baseline_ppl >= 0 else ""
+                    print(f"  [Eval step {global_step}] loss={eval_loss:.4f}  PPL={ppl:.2f}  "
+                          f"({sign}{ppl-baseline_ppl:.2f} vs baseline={baseline_ppl:.2f})")
+
+                    if ppl < best_ppl:
+                        best_ppl = ppl
+                        ckpt = os.path.join(args.output_dir, "best_connect.pt")
+                        model.save_connect(ckpt)
+                        save_checkpoint_meta(ckpt, cfg, args, epoch=epoch,
+                                             global_step=global_step, eval_ppl=ppl)
+                        print(f"  Best saved: {ckpt}")
+                except torch.cuda.OutOfMemoryError as e:
+                    print(f"  [Eval step {global_step}] SKIPPED — OOM: {e}")
+                    torch.cuda.empty_cache()
+                finally:
+                    model.train()
+                    model.connect.train()
 
             if args.max_steps is not None and global_step >= args.max_steps:
                 break
