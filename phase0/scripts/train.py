@@ -130,6 +130,10 @@ def parse_args():
                    help="Recompute activations during backward instead of storing them. "
                         "~2× slower backward but reduces activation VRAM by ~10-20×. "
                         "Enables seq_len=4096 with batch_size=2 on 16GB GPU.")
+    p.add_argument("--loss_chunk_size",  type=int,   default=512,
+                   help="Compute LM cross-entropy in chunks of this many tokens to avoid "
+                        "materialising full [B, S, vocab] logits tensor (~2.4 GB at S=4096). "
+                        "Set 0 to disable. Default: 512.")
     p.add_argument("--grad_accum",      type=int,   default=1,
                    help="Gradient accumulation steps. Effective batch = batch_size × grad_accum. "
                         "Use to increase effective batch without more VRAM. Default: 1 (disabled).")
@@ -416,6 +420,7 @@ def main():
         aux_loss_gamma        = args.aux_loss_gamma,
         consistency_weight    = args.consistency_weight,
         gradient_checkpointing = args.gradient_checkpointing,
+        loss_chunk_size       = args.loss_chunk_size,
     )
     if args.n_iter < 2:
         raise ValueError("Training connect layer requires --n_iter >= 2; n_iter=1 is baseline pass-through.")
@@ -682,6 +687,7 @@ def main():
                 log_start = time.perf_counter()
 
             if args.eval_steps > 0 and global_step % args.eval_steps == 0:
+                torch.cuda.empty_cache()
                 eval_loss, ppl = eval_suite(model, eval_dl, device, args,
                                             baseline_ppl, writer, global_step)
                 sign = "+" if ppl - baseline_ppl >= 0 else ""
@@ -738,6 +744,7 @@ def main():
 
         # -- Eval on eval split --------------------------------------------
         if args.eval_every > 0 and epoch % args.eval_every == 0:
+            torch.cuda.empty_cache()
             eval_loss, ppl = eval_suite(model, eval_dl, device, args,
                                         baseline_ppl, writer, global_step)
             sign = "+" if ppl - baseline_ppl >= 0 else ""

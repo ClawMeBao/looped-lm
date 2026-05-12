@@ -105,6 +105,7 @@ CMD=(
     --curriculum                    # ramp n_iter 2→3 over training
     --attn_impl      sdpa           # PyTorch built-in SDPA (no extra package)
     --gradient_checkpointing        # recompute activations → 10-20× less VRAM, ~2× slower bwd
+    --loss_chunk_size 512           # chunked CE: never materialise [B,S,151936] = 2.4 GB
 
     # ── Session management (Kaggle-friendly) ─────────────────────────────────
     --save_every     50             # write resume.pt every 50 steps

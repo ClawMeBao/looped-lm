@@ -26,6 +26,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.utils.checkpoint
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
@@ -36,6 +37,53 @@ from common.connect_layer import (
     GatedResidualConnectLayer,
     IterationAwareConnectLayer,
 )
+
+
+# ---------------------------------------------------------------------------
+# Chunked cross-entropy: avoids materialising full [B, S, vocab] logits tensor.
+# With seq_len=4096 and vocab=151936, full logits = 2.4 GB.
+# Chunking to 512 tokens at a time: 0.31 GB per chunk — fits on 16 GB GPU.
+# Gradients flow correctly through each chunk's lm_head call.
+# ---------------------------------------------------------------------------
+
+def _chunked_lm_loss(
+    h:            torch.Tensor,   # [B, S, d_model]
+    lm_head:      nn.Module,
+    labels:       torch.Tensor,   # [B, S] — raw labels (NOT shifted yet)
+    chunk_size:   int = 512,
+    ignore_index: int = -100,
+) -> torch.Tensor:
+    """
+    Compute LM cross-entropy loss without ever materialising [B, S, vocab].
+
+    Predicts token t+1 from position t, matching the convention of
+    `CrossEntropyLoss(logits[...,:-1,:], labels[...,1:])`.
+    """
+    B, S, _d = h.shape
+    total_loss   = h.new_zeros(())   # scalar, on same device/dtype as h
+    total_tokens = 0
+
+    for start in range(0, S - 1, chunk_size):
+        end          = min(start + chunk_size, S - 1)
+        chunk_h      = h[:, start:end, :]                             # [B, C, d]
+        chunk_logits = lm_head(chunk_h)                               # [B, C, V]
+        chunk_labels = labels[:, start + 1 : end + 1].contiguous()   # [B, C]
+        chunk_labels = chunk_labels.to(chunk_logits.device).view(-1)  # [B*C]
+        valid = int((chunk_labels != ignore_index).sum().item())
+        if valid == 0:
+            continue
+        chunk_loss  = F.cross_entropy(
+            chunk_logits.contiguous().view(-1, chunk_logits.size(-1)),
+            chunk_labels,
+            ignore_index=ignore_index,
+            reduction="sum",
+        )
+        total_loss   = total_loss + chunk_loss
+        total_tokens += valid
+
+    if total_tokens == 0:
+        return total_loss   # 0 — safe for backward
+    return total_loss / total_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -63,6 +111,10 @@ class Phase0Config:
     # ~2× slower backward but reduces activation memory by ~10-20×.
     # Enables seq_len=4096 on 16GB GPU. Has no effect on early (no_grad) iterations.
     gradient_checkpointing: bool         = False
+    # Chunked LM loss: compute cross-entropy over chunk_size tokens at a time.
+    # Prevents materialising [B, S, vocab] (2.4 GB at S=4096, vocab=151936).
+    # Works for both training and eval. Set 0 to disable (use full logits).
+    loss_chunk_size:        int          = 512
 
     def validate(self, num_layers: int):
         valid_connect = {"residual", "mlp", "gated", "iter_aware"}
@@ -309,11 +361,18 @@ class Phase0Model(nn.Module):
                                              pos_emb, causal_mask, position_ids, cache_position,
                                              use_checkpoint=self.cfg.gradient_checkpointing)
                     h_norm_i = self.norm(h_aux.to(self._dev(self.norm)))
-                    logits_i = self.lm_head(h_norm_i.to(self._dev(self.lm_head)))
-                    loss_i = nn.CrossEntropyLoss(ignore_index=-100)(
-                        logits_i[..., :-1, :].contiguous().view(-1, logits_i.size(-1)),
-                        labels[..., 1:].contiguous().view(-1).to(logits_i.device),
-                    )
+                    h_norm_i_dev = h_norm_i.to(self._dev(self.lm_head))
+                    if self.cfg.loss_chunk_size > 0:
+                        loss_i = _chunked_lm_loss(
+                            h_norm_i_dev, self.lm_head, labels.to(h_norm_i_dev.device),
+                            chunk_size=self.cfg.loss_chunk_size,
+                        )
+                    else:
+                        logits_i = self.lm_head(h_norm_i_dev)
+                        loss_i = nn.CrossEntropyLoss(ignore_index=-100)(
+                            logits_i[..., :-1, :].contiguous().view(-1, logits_i.size(-1)),
+                            labels[..., 1:].contiguous().view(-1).to(logits_i.device),
+                        )
                     aux_losses.append(loss_i)
 
                 if labels is not None and self.cfg.consistency_weight > 0.0:
@@ -382,16 +441,32 @@ class Phase0Model(nn.Module):
                              use_checkpoint=self.cfg.gradient_checkpointing)
         h = self.norm(h.to(self._dev(self.norm)))
 
-        # 7. LM Head (frozen weights, activations flow grad back to connect)
-        logits = self.lm_head(h.to(self._dev(self.lm_head)))    # [B, S, vocab]
+        # 7. LM Head + Loss
+        # When labels provided and chunked loss enabled: avoid materialising [B, S, vocab].
+        # Otherwise: compute full logits (needed for logit-based eval or generation).
+        loss   = None
+        logits = None
 
-        # 8. Loss
-        loss = None
-        if labels is not None:
-            lm_loss = nn.CrossEntropyLoss(ignore_index=-100)(
-                logits[..., :-1, :].contiguous().view(-1, logits.size(-1)),
-                labels[..., 1:].contiguous().view(-1).to(logits.device),
+        if labels is not None and self.cfg.loss_chunk_size > 0:
+            # Chunked path: lm_head called per chunk — max VRAM = [B, chunk, vocab]
+            h_dev = h.to(self._dev(self.lm_head))
+            lm_loss = _chunked_lm_loss(
+                h_dev, self.lm_head, labels.to(h_dev.device),
+                chunk_size=self.cfg.loss_chunk_size,
             )
+        else:
+            # Full logits path (generation / chunk disabled)
+            logits  = self.lm_head(h.to(self._dev(self.lm_head)))   # [B, S, vocab]
+            if labels is not None:
+                lm_loss = nn.CrossEntropyLoss(ignore_index=-100)(
+                    logits[..., :-1, :].contiguous().view(-1, logits.size(-1)),
+                    labels[..., 1:].contiguous().view(-1).to(logits.device),
+                )
+            else:
+                lm_loss = None
+
+        # 8. Combine losses
+        if labels is not None:
             loss = lm_loss
             aux_total = None
             consistency_total = None
