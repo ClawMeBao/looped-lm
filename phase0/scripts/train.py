@@ -10,7 +10,7 @@ TensorBoard:
     tensorboard --logdir phase0/checkpoints/runs
 """
 
-import argparse, sys, os, math, json, time
+import argparse, sys, os, math, json, time, itertools
 from dataclasses import asdict
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
@@ -528,6 +528,7 @@ def main():
     best_ppl       = float("inf")
     global_step    = 0
     start_epoch    = 1
+    resume_batch   = 0   # micro-batches already processed in start_epoch
 
     # -- Resume from step checkpoint ---------------------------------------
     if args.resume:
@@ -535,11 +536,13 @@ def main():
         model.connect.load_state_dict(ckpt_data["connect"])
         optimizer.load_state_dict(ckpt_data["optimizer"])
         scheduler.load_state_dict(ckpt_data["scheduler"])
-        global_step = ckpt_data.get("global_step", 0)
-        start_epoch = ckpt_data.get("epoch", 1)
-        best_ppl    = ckpt_data.get("best_ppl", float("inf"))
+        global_step  = ckpt_data.get("global_step", 0)
+        start_epoch  = ckpt_data.get("epoch", 1)
+        best_ppl     = ckpt_data.get("best_ppl", float("inf"))
+        resume_batch = ckpt_data.get("batches_in_epoch", 0)
         print(f"[resume] Loaded checkpoint from '{args.resume}' "
-              f"(step={global_step}, epoch={start_epoch}, best_ppl={best_ppl:.2f})")
+              f"(step={global_step}, epoch={start_epoch}, best_ppl={best_ppl:.2f}, "
+              f"skip_batches={resume_batch})")
 
     # -- Extra-steps: extend training by N more steps from resume point ----
     if args.extra_steps is not None:
@@ -582,6 +585,9 @@ def main():
         _acc_tokens  = 0
         optimizer.zero_grad()
 
+        # Micro-batches processed so far this epoch (for resume tracking)
+        batches_in_epoch = 0
+
         def _do_optimizer_step(cur_n, epoch):
             """Clip + step + zero. Returns grad_norm."""
             nonlocal accum_micro, _acc_loss, _acc_lm_loss, _acc_tokens
@@ -593,13 +599,28 @@ def main():
             _acc_loss = 0.0; _acc_lm_loss = 0.0; _acc_tokens = 0
             return gn
 
+        # Skip batches already processed in this epoch when resuming mid-epoch.
+        # resume_batch is only non-zero on the first resumed epoch; clear after.
+        skip_n = resume_batch if epoch == start_epoch else 0
+        resume_batch = 0   # only skip once
+
+        dl_iter = iter(train_dl)
+        if skip_n > 0:
+            print(f"  [resume] Skipping {skip_n} already-processed micro-batches in epoch {epoch}…")
+            consumed = sum(1 for _ in itertools.islice(dl_iter, skip_n))
+            batches_in_epoch = consumed
+            print(f"  [resume] Skipped {consumed} batches, resuming from batch {consumed+1}")
+
         # cur_n shown in tqdm postfix; compute start value just for clarity
         pbar = tqdm(
-            train_dl,
+            dl_iter,
             desc=f"Epoch {epoch}/{max_epochs}",
             unit="batch", dynamic_ncols=True,
+            total=len(train_dl) - skip_n,
+            initial=0,
         )
         for batch in pbar:
+            batches_in_epoch += 1
             ids, labels  = _unpack_batch(batch, device)
             n_tokens = int((labels[:, 1:] != -100).sum().item())
             if n_tokens == 0:
@@ -692,19 +713,20 @@ def main():
                 tmp_ckpt    = resume_ckpt + ".tmp"
                 torch.save(
                     {
-                        "connect":     model.connect.state_dict(),
-                        "optimizer":   optimizer.state_dict(),
-                        "scheduler":   scheduler.state_dict(),
-                        "global_step": global_step,
-                        "epoch":       epoch,
-                        "best_ppl":    best_ppl,
-                        "cfg":         {**asdict(cfg), "n_iter": args.n_iter},
-                        "args":        vars(args),
+                        "connect":          model.connect.state_dict(),
+                        "optimizer":        optimizer.state_dict(),
+                        "scheduler":        scheduler.state_dict(),
+                        "global_step":      global_step,
+                        "epoch":            epoch,
+                        "best_ppl":         best_ppl,
+                        "batches_in_epoch": batches_in_epoch,
+                        "cfg":              {**asdict(cfg), "n_iter": args.n_iter},
+                        "args":             vars(args),
                     },
                     tmp_ckpt,
                 )
                 os.replace(tmp_ckpt, resume_ckpt)  # atomic overwrite
-                print(f"  [ckpt] Resume checkpoint → {resume_ckpt}  (step {global_step})")
+                print(f"  [ckpt] Resume checkpoint → {resume_ckpt}  (step {global_step}, batch {batches_in_epoch})")
 
             if args.eval_steps > 0 and global_step % args.eval_steps == 0:
                 try:
